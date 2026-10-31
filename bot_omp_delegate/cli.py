@@ -47,13 +47,15 @@ class Client:
                                      headers={"Authorization": "Bearer " + self.token,
                                               "Content-Type": "application/json"})
         try:
-            with self.transport.open(req, timeout=135 if route.endswith("/compact") else 75) as response:
+            timeout = 150 if method == "POST" else 75
+            with self.transport.open(req, timeout=timeout) as response:
                 payload = response.read()
         except urllib.error.HTTPError as exc:
-            try:
-                detail = json.loads(exc.read().decode("utf-8"))
-            except Exception:
-                detail = exc.reason
+            with exc:
+                try:
+                    detail = json.loads(exc.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    detail = exc.reason
             raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             raise RuntimeError(f"daemon request failed: {exc}") from exc
@@ -95,6 +97,33 @@ def _wait(client: Client, job_id: str, max_hours: float | None, interrupt_at_dea
         snapshot = client.request("GET", route + f"/wait?timeout={min(60, remaining)}")
 
 
+def _worker_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model")
+    parser.add_argument("--thinking")
+    parser.add_argument("--profile")
+    parser.add_argument("--config", action="append", default=[])
+    parser.add_argument("--add-dir", action="append", default=[])
+    parser.add_argument("--tools")
+    parser.add_argument("--approval-mode", choices=("yolo", "write", "always-ask", "always-ask-cached"))
+
+
+def _options(args: argparse.Namespace) -> dict[str, Any]:
+    values = vars(args)
+    options = {key: values[key] for key in ("model", "thinking", "profile", "tools", "approval_mode")
+               if values.get(key) is not None}
+    for field in ("config", "add_dir"):
+        paths = values.get(field) or []
+        if paths:
+            normalized = []
+            for value in paths:
+                path = Path(value).expanduser()
+                if not path.is_absolute():
+                    raise ValueError(f"--{field.replace('_', '-')} paths must be absolute: {value}")
+                normalized.append(str(path.resolve()))
+            options[field] = normalized
+    return options
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="omp-delegate", description="Manage OMP delegated sessions and jobs.")
     parser.add_argument("--state-dir", help="daemon state directory (default: ~/.omp-delegate)")
@@ -108,16 +137,61 @@ def _parser() -> argparse.ArgumentParser:
     create = sess.add_parser("create")
     create.add_argument("--name", required=True)
     create.add_argument("--cwd", required=True)
-    create.add_argument("--model")
-    create.add_argument("--thinking")
-    create.add_argument("--profile")
-    create.add_argument("--config", action="append", default=[])
-    create.add_argument("--add-dir", action="append", default=[])
-    create.add_argument("--tools")
-    create.add_argument("--approval-mode", choices=("yolo", "write", "always-ask", "always-ask-cached"))
-    sess.add_parser("list")
-    compact = sess.add_parser("compact")
-    compact.add_argument("id")
+    _worker_options(create)
+    listing = sess.add_parser("list")
+    listing.add_argument("--archived", action="store_true")
+    for action in ("show", "open", "compact", "archive", "unarchive"):
+        command = sess.add_parser(action)
+        command.add_argument("id")
+    close = sess.add_parser("close")
+    close.add_argument("id")
+    close.add_argument("--interrupt", action="store_true")
+    configure = sess.add_parser("configure")
+    configure.add_argument("id")
+    _worker_options(configure)
+    delete = sess.add_parser("delete")
+    delete.add_argument("id")
+    delete.add_argument("--confirm-id", required=True)
+    lane = subs.add_parser("lane", help="manage work lanes")
+    lanes = lane.add_subparsers(dest="action", required=True)
+    lane_create = lanes.add_parser("create")
+    lane_create.add_argument("--name", required=True)
+    lane_create.add_argument("--cwd", required=True)
+    _worker_options(lane_create)
+    lanes.add_parser("list")
+    for action in ("show", "new"):
+        command = lanes.add_parser(action)
+        command.add_argument("id")
+    run = lanes.add_parser("run")
+    run.add_argument("id")
+    run.add_argument("message")
+    run.add_argument("--detach", action="store_true")
+    run.add_argument("--max-hours", type=float, default=6)
+    run.add_argument("--interrupt-at-deadline", action="store_true")
+    close_lane = lanes.add_parser("close")
+    close_lane.add_argument("id")
+    close_lane.add_argument("--interrupt", action="store_true")
+    assign = lanes.add_parser("assign")
+    assign.add_argument("id")
+    assign.add_argument("--session", required=True)
+    assign.add_argument("--expected-revision", type=int, required=True)
+    delete_lane = lanes.add_parser("delete")
+    delete_lane.add_argument("id")
+    delete_lane.add_argument("--expected-revision", type=int)
+    agent = subs.add_parser("agent", help="inspect or control a job subagent")
+    agents = agent.add_subparsers(dest="action", required=True)
+    agent_list = agents.add_parser("list")
+    agent_list.add_argument("job")
+    agent_read = agents.add_parser("read")
+    agent_read.add_argument("job")
+    agent_read.add_argument("agent")
+    agent_read.add_argument("--from-byte", type=int, default=0)
+    for action in ("steer", "cancel"):
+        command = agents.add_parser(action)
+        command.add_argument("job")
+        command.add_argument("agent")
+        if action == "steer":
+            command.add_argument("message")
     turn = subs.add_parser("turn", help="send a prompt to a session")
     turn.add_argument("session")
     turn.add_argument("message")
@@ -179,7 +253,7 @@ def _daemon(args: argparse.Namespace, state: Path, port: int) -> int:
             result = Client(state, port).request("GET", "/health")
             _emit({"status": "running", "port": port, "health": result})
             return 0
-        except RuntimeError as exc:
+        except RuntimeError:
             _emit({"status": "stopped", "port": port})
             return 1
     if args.action == "stop":
@@ -190,11 +264,11 @@ def _daemon(args: argparse.Namespace, state: Path, port: int) -> int:
     try:
         Client(state, port).request("POST", "/shutdown", {})
     except RuntimeError:
-        # Starting below still fails if another owner holds the state lock.
         pass
     _await_shutdown(state)
     args.action = "start"
     return _daemon(args, state, port)
+
 
 def _await_shutdown(state: Path) -> None:
     path = state / "daemon.lock"
@@ -209,9 +283,12 @@ def _await_shutdown(state: Path) -> None:
                 return
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("daemon did not finish shutdown within 45 seconds")
+                    raise RuntimeError("Daemon did not finish shutdown within 45 seconds")
                 time.sleep(0.1)
 
+
+def _encoded(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -224,6 +301,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("port must be between 1 and 65535")
         if hasattr(args, "max_hours") and (not math.isfinite(args.max_hours) or args.max_hours <= 0):
             raise ValueError("max-hours must be finite and positive")
+        if hasattr(args, "after") and args.after < 0:
+            raise ValueError("after must be nonnegative")
+        if hasattr(args, "from_byte") and args.from_byte < 0:
+            raise ValueError("from-byte must be nonnegative")
+        if getattr(args, "expected_revision", None) is not None and args.expected_revision < 0:
+            raise ValueError("expected-revision must be nonnegative")
         if args.command == "serve":
             from .server import serve
             serve(state, port)
@@ -232,47 +315,83 @@ def main(argv: list[str] | None = None) -> int:
             return _daemon(args, state, port)
         client = Client(state, port)
         if args.command == "session":
+            base = f"/sessions/{_encoded(args.id)}" if hasattr(args, "id") else "/sessions"
             if args.action == "list":
-                _emit(client.request("GET", "/sessions"))
+                _emit(client.request("GET", "/sessions?archived=1" if args.archived else "/sessions"))
+            elif args.action == "create":
+                body = {"name": args.name, "cwd": str(Path(args.cwd).expanduser().resolve()), "options": _options(args)}
+                _emit(client.request("POST", "/sessions", body))
+            elif args.action == "show":
+                _emit(client.request("GET", base))
             elif args.action == "compact":
-                _emit(client.request("POST", f"/sessions/{urllib.parse.quote(args.id)}/compact", {}))
+                _emit(client.request("POST", base + "/compact", {}))
+            elif args.action == "configure":
+                _emit(client.request("POST", base + "/configure", {"options": _options(args)}))
+            elif args.action == "delete":
+                _emit(client.request("POST", base + "/delete", {"confirmId": args.confirm_id}))
+            elif args.action in {"open", "archive", "unarchive"}:
+                _emit(client.request("POST", base + "/" + args.action, {}))
+            elif args.action == "close":
+                _emit(client.request("POST", base + "/close", {"interrupt": args.interrupt}))
             else:
-                options = {key: value for key, value in vars(args).items()
-                           if key in {"model", "thinking", "profile", "tools", "approval_mode"} and value is not None}
-                if args.config:
-                    options["config"] = args.config
-                if args.add_dir:
-                    options["add_dir"] = args.add_dir
-                _emit(client.request("POST", "/sessions", {"name": args.name, "cwd": str(Path(args.cwd).expanduser().resolve()), "options": options}))
+                _emit(client.request("POST", base + "/delete", {"confirmId": args.confirm_id}))
+            return 0
+        if args.command == "lane":
+            if args.action == "create":
+                body = {"name": args.name, "cwd": str(Path(args.cwd).expanduser().resolve()), "options": _options(args)}
+                _emit(client.request("POST", "/lanes", body))
+            elif args.action == "list":
+                _emit(client.request("GET", "/lanes"))
+            elif args.action == "show":
+                _emit(client.request("GET", f"/lanes/{_encoded(args.id)}"))
+            elif args.action in {"run", "close", "new"}:
+                body = {"message": args.message} if args.action == "run" else (
+                    {"interrupt": args.interrupt} if args.action == "close" else {})
+                result = client.request("POST", f"/lanes/{_encoded(args.id)}/{args.action}", body)
+                _emit(result)
+                if args.action == "run" and not args.detach:
+                    return _wait(client, result["id"], args.max_hours, args.interrupt_at_deadline)
+            elif args.action == "assign":
+                body = {"sessionId": args.session, "expectedRevision": args.expected_revision}
+                _emit(client.request("POST", f"/lanes/{_encoded(args.id)}/assign", body))
+            else:
+                body = {} if args.expected_revision is None else {"expectedRevision": args.expected_revision}
+                _emit(client.request("POST", f"/lanes/{_encoded(args.id)}/delete", body))
+            return 0
+        if args.command == "agent":
+            route = f"/jobs/{_encoded(args.job)}/agents/{args.action}"
+            body: dict[str, Any] = {}
+            if args.action != "list":
+                body["subagentId"] = args.agent
+            if args.action == "read":
+                body["fromByte"] = args.from_byte
+            elif args.action == "steer":
+                body["message"] = args.message
+            _emit(client.request("POST", route, body))
             return 0
         if args.command == "turn":
-            job = client.request("POST", f"/sessions/{urllib.parse.quote(args.session)}/turn", {"message": args.message})
+            job = client.request("POST", f"/sessions/{_encoded(args.session)}/turn", {"message": args.message})
             _emit(job)
             return 0 if args.detach else _wait(client, job["id"], args.max_hours, args.interrupt_at_deadline)
         if args.command == "wait":
             return _wait(client, args.job, args.max_hours, args.interrupt_at_deadline)
         if args.command == "read":
-            _emit(client.request("GET", f"/jobs/{urllib.parse.quote(args.job)}"))
-            return 0
-        if args.command == "events":
-            _emit(client.request("GET", f"/jobs/{urllib.parse.quote(args.job)}/events?after={args.after}"))
-            return 0
-        if args.command == "steer":
-            _emit(client.request("POST", f"/jobs/{urllib.parse.quote(args.job)}/steer", {"message": args.message}))
-            return 0
-        if args.command == "interrupt":
-            _emit(client.request("POST", f"/jobs/{urllib.parse.quote(args.job)}/interrupt", {}))
-            return 0
-        if args.command == "answer":
+            _emit(client.request("GET", f"/jobs/{_encoded(args.job)}"))
+        elif args.command == "events":
+            _emit(client.request("GET", f"/jobs/{_encoded(args.job)}/events?after={args.after}"))
+        elif args.command == "steer":
+            _emit(client.request("POST", f"/jobs/{_encoded(args.job)}/steer", {"message": args.message}))
+        elif args.command == "interrupt":
+            _emit(client.request("POST", f"/jobs/{_encoded(args.job)}/interrupt", {}))
+        elif args.command == "answer":
             try:
                 answer = json.loads(args.answer_json)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"--json must be valid JSON: {exc}") from exc
             if not isinstance(answer, dict):
                 raise RuntimeError("--json must decode to a JSON object")
-            _emit(client.request("POST", f"/jobs/{urllib.parse.quote(args.job)}/answer", answer))
-            return 0
-        parser.error("unknown command")
+            _emit(client.request("POST", f"/jobs/{_encoded(args.job)}/answer", answer))
+        return 0
     except (RuntimeError, OSError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1

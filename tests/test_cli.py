@@ -9,6 +9,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+
 class LocalTransportTests(unittest.TestCase):
     def test_proxy_environment_cannot_receive_daemon_token_or_prompt(self):
         proxy_requests = []

@@ -1,5 +1,7 @@
 import base64
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -38,6 +40,17 @@ class DecoderTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def child_worker(self, code, callback):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        worker = Worker(".", directory.name, {}, callback)
+        worker.process = subprocess.Popen(
+            [sys.executable, "-u", "-c", code], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, start_new_session=True, bufsize=0,
+        )
+        self.addCleanup(worker.close)
+        return worker
+
     def test_request_correlates_response_not_event_order(self):
         worker = Worker(".", "/tmp/session", {}, lambda event: None)
         class Fake:
@@ -55,12 +68,9 @@ class WorkerTests(unittest.TestCase):
 
     def test_pending_request_is_failed_and_exit_event_emitted_on_eof(self):
         events = []
-        worker = Worker(".", "/tmp/session", {}, events.append)
+        worker = self.child_worker("pass", events.append)
         waiter = __import__("queue").Queue(maxsize=1)
         worker._pending["id"] = waiter
-        class Stream:
-            def read(self, _size): return b""
-        worker.process = type("P", (), {"stdout": Stream()})()
         worker._read_stdout()
         self.assertIn("exited", str(waiter.get_nowait()))
         self.assertEqual(events[-1]["type"], "delegate_worker_exit")
@@ -71,10 +81,29 @@ class WorkerTests(unittest.TestCase):
             events.append(frame)
             if frame.get("type") == "event":
                 raise ValueError("callback")
-        worker = Worker(".", "/tmp/session", {}, callback)
-        worker.process = type("P", (), {"poll": lambda self: 0, "stdout": type("S", (), {"read": lambda self, size: b'{\"type\":\"event\"}\\n'})()})()
+        worker = self.child_worker(
+            "import time; print('{\"type\":\"event\"}', flush=True); time.sleep(60)",
+            callback,
+        )
         worker._read_stdout()
         self.assertEqual(events[-1]["type"], "delegate_worker_exit")
+        self.assertIsNotNone(worker.process.poll())
+
+    def test_close_fails_pending_response_and_releases_worker(self):
+        worker = self.child_worker("import time; time.sleep(60)", lambda frame: None)
+        ticket = worker.begin_request("get_state")
+        worker.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            ticket.result(timeout=0.1)
+        self.assertFalse(worker.alive)
+
+    def test_close_before_start_cannot_spawn_late_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worker = Worker(".", directory, {}, lambda frame: None)
+            worker.close()
+            with self.assertRaisesRegex(RuntimeError, "closed before startup"):
+                worker.start()
+            self.assertIsNone(worker.process)
 
     @patch("bot_omp_delegate.worker.subprocess.Popen", side_effect=OSError("missing"))
     def test_start_reports_spawn_failure(self, _popen):

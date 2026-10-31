@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.omp-delegate/
+.omp/
+.env
+.env.*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+auth.json
+credentials*.json
+token

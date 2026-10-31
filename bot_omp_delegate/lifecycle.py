@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .worker import Worker
+from .notifications import Notifications
 
 TERMINAL = {"completed", "aborted", "error", "interrupted"}
 INPUT_METHODS = {"select", "confirm", "input", "editor", "ask"}
@@ -71,7 +72,7 @@ def identifier(value):
 
 
 class Store:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, webhooks=None, clock=None):
         self.root = Path(root).absolute()
         private_dir(self.root)
         self.root = self.root.resolve()
@@ -107,6 +108,7 @@ class Store:
             session.setdefault("lastJob", None)
             session["worker"] = self._stopped()
         self.jobs = {}
+        recovered_jobs = []
         for path in (self.root / "jobs").glob("*.json"):
             job = self._load(path, {})
             if identifier(job["id"]) != path.stem:
@@ -115,11 +117,77 @@ class Store:
             if job["status"] not in TERMINAL:
                 job.update(status="interrupted", error="Daemon stopped before the job settled; prompt was not replayed", pendingInput=[], finishedAt=time.time())
                 atomic_json(path, job)
+                recovered_jobs.append(job)
             self.jobs[job["id"]] = job
         self._recover_purge()
         self._save_state()
         # Old metadata must not retain a second, undeletable copy of conversations.
         (self.root / "sessions.json").unlink(missing_ok=True)
+        self.notifications = Notifications(webhooks, clock)
+        self._monitor_stop = threading.Event()
+        self._monitor_wake = threading.Event()
+        self._monitor_thread = None
+        for job in recovered_jobs:
+            session = self.sessions.get(job["sessionId"])
+            if session is not None:
+                self.notifications.finished(job, session, self._lane_for_session(session["id"]))
+
+    def _lane_for_session(self, sid):
+        return next((lane for lane in self.lanes.values() if lane["sessionId"] == sid), None)
+
+    def start_monitor(self):
+        with self.cv:
+            self._monitor_wake.set()
+            if self.closing or not self.notifications.enabled:
+                return
+            if self._monitor_thread is None:
+                self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True, name="webhook-inactivity")
+                self._monitor_thread.start()
+
+    def _monitor_loop(self):
+        while not self._monitor_stop.is_set():
+            enabled = self.notifications.enabled
+            if enabled:
+                try:
+                    self.monitor_tick()
+                except Exception:
+                    self.notifications.failures += 1
+            self._monitor_wake.wait(1 if enabled else None)
+            self._monitor_wake.clear()
+
+    def monitor_tick(self):
+        with self.cv:
+            if not self.closing:
+                self.notifications.tick(
+                    self.jobs, self.sessions, self.lanes,
+                    lambda sid: self._busy(sid) or self.session(sid)["availability"] != "available"
+                    or self.session(sid)["worker"]["state"] in {"starting", "closing", "failed"}
+                    or any(lid in self.lane_operations and lane["sessionId"] == sid for lid, lane in self.lanes.items()),
+                )
+
+    def deadline(self, jid):
+        with self.cv:
+            job = self.job(jid)
+            if job["status"] not in TERMINAL and not job.get("deadlineNotified"):
+                job["deadlineNotified"] = True
+                self._save_job(job)
+                session = self.session(job["sessionId"])
+                self.notifications.emit("run.deadline", job, session, self._lane_for_session(session["id"]),
+                                        "Coordinator waiter reached its deadline; the job may still be running")
+            return copy.deepcopy(job)
+
+    def request_shutdown(self, idle_only=False):
+        if type(idle_only) is not bool:
+            raise ValueError("idleOnly must be a boolean")
+        with self.cv:
+            if idle_only and (
+                any(job["status"] not in TERMINAL for job in self.jobs.values())
+                or self.reserved or self.startup_runs or self.opening or self.interrupting or self.lane_operations
+                or any(s["worker"]["state"] in {"starting", "closing"} for s in self.sessions.values())
+                or any(self.session(sid)["worker"]["state"] == "failed" and w.alive for sid, w in self.workers.items())
+            ):
+                raise Conflict("Daemon has active jobs or lifecycle transitions; restart was not performed")
+            self.closing = True
 
     @staticmethod
     def _load(path, default):
@@ -283,8 +351,10 @@ class Store:
                     self._save_state()
             raise
 
-    def turn(self, sid, message):
+    def turn(self, sid, message, label=None):
         message = text({"message": message}, "message")
+        if label is not None and (not isinstance(label, str) or not label.strip() or len(label) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in label)):
+            raise ValueError("label must be non-empty, at most 200 characters and contain no control characters")
         with self.cv:
             session = self.session(sid)
             self._available(session)
@@ -292,11 +362,14 @@ class Store:
             job = {"id": jid, "sessionId": sid, "status": "running", "error": None,
                    "finalMessage": "", "pendingInput": [], "startedAt": time.time(), "finishedAt": None,
                    "nextSeq": 0, "workerGeneration": session["worker"]["generation"]}
+            if label is not None:
+                job["label"] = label
             self.jobs[jid] = job
             session.update(activeJob=jid, lastJob=jid, lastActivity=time.time())
             session["worker"]["state"] = "busy" if sid in self.ready else "starting"
             self._save_job(job)
             self._save_state()
+            self.notifications.started(job)
             initial = copy.deepcopy(job)
             threading.Thread(target=self._run, args=(sid, jid, message), daemon=True).start()
             return initial
@@ -338,6 +411,7 @@ class Store:
         session["lastActivity"] = time.time()
         self._save_job(job)
         self._save_state()
+        self.notifications.finished(job, session, self._lane_for_session(session["id"]))
         self.cv.notify_all()
 
     def event(self, sid, frame, generation=None):
@@ -364,6 +438,8 @@ class Store:
             job = self.job(jid)
             if generation is not None and generation != job["workerGeneration"]:
                 return
+            if self.notifications.has_output(frame):
+                self.notifications.output(job)
             event = dict(frame, seq=job["nextSeq"])
             job["nextSeq"] += 1
             path = self.root / "jobs" / f"{jid}.jsonl"
@@ -387,6 +463,10 @@ class Store:
                     job["pendingInput"] = [p for p in job["pendingInput"] if p["id"] != frame.get("targetId")]
                 job["status"] = "waiting_input" if job["pendingInput"] else "running"
                 changed = True
+                if job["pendingInput"]:
+                    self.notifications.needs_input(job, session, self._lane_for_session(sid))
+                else:
+                    self.notifications.resumed(job)
             elif kind == "message_end":
                 message = frame.get("message", {})
                 if message.get("role") == "assistant":
@@ -442,6 +522,7 @@ class Store:
                 worker.respond_ui(data)
                 job["pendingInput"] = [p for p in job["pendingInput"] if p["id"] != ui_id]
                 job["status"] = "waiting_input" if job["pendingInput"] else "running"
+                self.notifications.resumed(job)
                 self._save_job(job)
                 self.cv.notify_all()
                 return copy.deepcopy(job)
@@ -676,7 +757,7 @@ class Store:
             sid = lane["sessionId"]
             session = self.session(sid)
             if action == "run":
-                job = self.turn(sid, text(data, "message"))
+                job = self.turn(sid, text(data, "message"), label=data.get("label"))
                 job["laneId"] = lid
                 self.jobs[job["id"]]["laneId"] = lid
                 self._save_job(self.jobs[job["id"]])
@@ -822,6 +903,8 @@ class Store:
     def close(self):
         with self.cv:
             self.closing = True
+            self._monitor_stop.set()
+            self._monitor_wake.set()
             workers = list(self.workers.items())
             for job in self.jobs.values():
                 if job["status"] not in TERMINAL:
@@ -829,6 +912,8 @@ class Store:
             for session in self.sessions.values():
                 if session["id"] in self.workers:
                     session["worker"]["state"] = "closing"
+        if self._monitor_thread is not None and self._monitor_thread is not threading.current_thread():
+            self._monitor_thread.join(timeout=2)
         failures = []
         def stop(sid, worker):
             try:

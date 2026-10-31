@@ -2,13 +2,17 @@
 
 ## Unreleased
 
+- Best-effort outbound webhook notifications with private configuration, filters, HMAC signing, bounded retries, sanitized receipts and explicit connectivity testing.
+- Versioned run completion/error/deadline/input/stall, optional lane-idle and daemon-start events, ticket labels, and atomic idle-only daemon stop/restart.
 - Persistent lanes with compact create/list/show/run/close/new workflows. Closed workers lazily resume the same conversation; new conversations retain previous history.
 - Advanced session open/close/archive/unarchive/configure/delete, revision-checked lane assignment/removal, and parent-job-bound subagent list/read/steer/cancel.
 - Versioned legacy-state migration and recoverable scoped purge. Serialize lifecycle transitions, quarantine failed cleanup, and reject stale controls and cross-task child transcript access.
 - Bounded OMP worker/process-group shutdown, including interrupt-close during startup, prewarming, pending questions and active work. Detached/external processes remain outside the guarantee.
 - Concise routine Grok skill with advanced instructions loaded on demand; no frontend, new dependencies, automatic idle timeout or Grok-native telemetry integration.
 
-Verification: 36 regression tests passed. Real OMP smoke on macOS exercised three simultaneous model-backed lanes; isolated worker close and conversation-preserving reopen; fresh conversations; pending-question and active-tool interruption; startup cancellation; configuration applied on reopen; archive/unarchive; scoped deletion; explicit assignment, prewarming and lane removal; actual subagent transcript reads, steering, cancellation and stale-parent rejection. Independent source-only correctness and deletion/security reviews found no remaining blockers after repairs. Linux and Grok cloud execution/notification behavior remain unverified.
+Webhook verification: all 67 tests passed, including the existing 36 regressions. A real model-backed OMP smoke observed all seven event types, verified the label and target-worktree Git metadata, and exercised idle-only restart. An isolated loopback receiver verified authentication and HMAC and returned HTTP 204 for connectivity tests before and after restart. Coverage includes filters, stall suppression/rearming, subscriber reloads, invalid timer configuration, four-attempt retry isolation, queue saturation, redaction, redirects/proxies, trickled-header deadlines and bounded graceful shutdown. External coordinator delivery and Linux remain unverified.
+
+Earlier lane-lifecycle verification: 36 regression tests passed. Real OMP smoke on macOS exercised three simultaneous model-backed lanes; isolated worker close and conversation-preserving reopen; fresh conversations; pending-question and active-tool interruption; startup cancellation; configuration applied on reopen; archive/unarchive; scoped deletion; explicit assignment, prewarming and lane removal; actual subagent transcript reads, steering, cancellation and stale-parent rejection. Independent source-only correctness and deletion/security reviews found no remaining blockers after repairs. Linux and Grok cloud execution/notification behavior remain unverified.
 
 Clean-distribution verification also passed all 36 tests, daemon startup with an unreachable configured HTTP proxy, and real prewarm-startup cancellation. Sensitive-data patterns and high-entropy Python literals were checked across all 18 intended source/documentation files with no findings; no runtime state or credentials were included.
 

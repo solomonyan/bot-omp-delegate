@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from .lifecycle import Conflict, Store, TERMINAL, private_dir, text
+from .webhooks import WebhookDispatcher
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -64,7 +65,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(data, dict):
                     raise ValueError("Request must be an object")
             if parts == ["health"] and not post:
-                result = {"status": "ok"}
+                result = {"status": "ok", "idleOnlyShutdown": True, "webhooks": 1}
+            elif parts == ["webhooks"] and not post:
+                result = self.server.webhooks.public_config()
+            elif parts == ["webhooks", "reload"] and post:
+                self.server.webhooks.reload()
+                store.start_monitor()
+                result = self.server.webhooks.public_config()
+            elif parts == ["webhooks", "test"] and post:
+                result = self.server.webhooks.test(data.get("event", "daemon.up"))
             elif parts == ["sessions"]:
                 if post:
                     result = store.create(data)
@@ -77,7 +86,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = store.show_session(parts[1])
             elif len(parts) == 3 and parts[0] == "sessions" and post:
                 if parts[2] == "turn":
-                    result = store.turn(parts[1], text(data, "message"))
+                    result = store.turn(parts[1], text(data, "message"), label=data.get("label"))
                 elif parts[2] == "compact":
                     result = store.compact(parts[1])
                 else:
@@ -108,11 +117,14 @@ class Handler(BaseHTTPRequestHandler):
                     if after < 0:
                         raise ValueError("after must be nonnegative")
                     result = store.events(jid, after)
+                elif len(parts) == 3 and post and parts[2] == "deadline":
+                    result = store.deadline(jid)
                 elif len(parts) == 3 and post:
                     result = store.control(jid, parts[2], data)
                 else:
                     raise KeyError("Unknown route")
             elif parts == ["shutdown"] and post:
+                store.request_shutdown(data.get("idleOnly", False))
                 result = {"status": "stopping"}
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             else:
@@ -153,12 +165,16 @@ def serve(state_dir: Path, port: int) -> None:
         server.daemon_threads = True
         try:
             server.token = token
-            server.store = Store(root)
+            server.webhooks = WebhookDispatcher(root)
+            server.store = Store(root, webhooks=server.webhooks)
+            server.store.start_monitor()
             def stop(_signum, _frame):
+                server.store.request_shutdown()
                 threading.Thread(target=server.shutdown, daemon=True).start()
             signal.signal(signal.SIGTERM, stop)
             signal.signal(signal.SIGINT, stop)
             print(json.dumps({"status": "ready", "host": "127.0.0.1", "port": port}), flush=True)
+            server.store.notifications.emit("daemon.up", summary="Delegate daemon started")
             server.serve_forever()
         finally:
             try:
@@ -166,3 +182,5 @@ def serve(state_dir: Path, port: int) -> None:
                     server.store.close()
             finally:
                 server.server_close()
+                if hasattr(server, "webhooks"):
+                    server.webhooks.close()

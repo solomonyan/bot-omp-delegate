@@ -91,6 +91,10 @@ def _wait(client: Client, job_id: str, max_hours: float | None, interrupt_at_dea
             return 1
         remaining = 60 if deadline is None else deadline - time.monotonic()
         if remaining <= 0:
+            try:
+                client.request("POST", route + "/deadline", {})
+            except RuntimeError:
+                print("Deadline notification unavailable; deadline exit behavior is unchanged", file=sys.stderr)
             if interrupt_at_deadline:
                 _emit(client.request("POST", route + "/interrupt", {}))
             return 3
@@ -132,6 +136,16 @@ def _parser() -> argparse.ArgumentParser:
     subs.add_parser("serve", help="run the daemon in the foreground")
     daemon = subs.add_parser("daemon", help="manage the detached daemon")
     daemon.add_argument("action", choices=("start", "status", "stop", "restart"))
+    daemon.add_argument("--idle-only", action="store_true", help="refuse stop/restart unless all sessions are settled")
+    webhook = subs.add_parser("webhook", help="manage private outbound subscribers")
+    hooks = webhook.add_subparsers(dest="action", required=True)
+    hooks.add_parser("list")
+    add = hooks.add_parser("add", help="read one subscriber JSON object from non-interactive stdin")
+    add.add_argument("--id", dest="subscriber_id")
+    remove = hooks.add_parser("remove")
+    remove.add_argument("subscriber_id")
+    test = hooks.add_parser("test")
+    test.add_argument("--event", default="daemon.up")
     session = subs.add_parser("session", help="manage sessions")
     sess = session.add_subparsers(dest="action", required=True)
     create = sess.add_parser("create")
@@ -168,6 +182,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--detach", action="store_true")
     run.add_argument("--max-hours", type=float, default=6)
     run.add_argument("--interrupt-at-deadline", action="store_true")
+    run.add_argument("--label")
     close_lane = lanes.add_parser("close")
     close_lane.add_argument("id")
     close_lane.add_argument("--interrupt", action="store_true")
@@ -198,6 +213,7 @@ def _parser() -> argparse.ArgumentParser:
     turn.add_argument("--detach", action="store_true")
     turn.add_argument("--max-hours", type=float, default=6)
     turn.add_argument("--interrupt-at-deadline", action="store_true")
+    turn.add_argument("--label")
     wait = subs.add_parser("wait", help="wait for a job to finish")
     wait.add_argument("job")
     wait.add_argument("--max-hours", type=float, default=6)
@@ -219,6 +235,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _daemon(args: argparse.Namespace, state: Path, port: int) -> int:
+    if args.idle_only and args.action not in {"stop", "restart"}:
+        raise ValueError("--idle-only applies only to stop or restart")
     if args.action == "start":
         try:
             Client(state, port).request("GET", "/health")
@@ -257,17 +275,67 @@ def _daemon(args: argparse.Namespace, state: Path, port: int) -> int:
             _emit({"status": "stopped", "port": port})
             return 1
     if args.action == "stop":
-        result = Client(state, port).request("POST", "/shutdown", {})
+        result = _shutdown_daemon(Client(state, port), args.idle_only)
         _await_shutdown(state)
         _emit(result)
         return 0
-    try:
-        Client(state, port).request("POST", "/shutdown", {})
-    except RuntimeError:
-        pass
+    if args.idle_only:
+        _shutdown_daemon(Client(state, port), True)
+    else:
+        try:
+            _shutdown_daemon(Client(state, port), False)
+        except RuntimeError:
+            pass
     _await_shutdown(state)
     args.action = "start"
+    args.idle_only = False
     return _daemon(args, state, port)
+
+
+def _shutdown_daemon(client: Client, idle_only: bool):
+    if idle_only:
+        health = client.request("GET", "/health")
+        if health.get("idleOnlyShutdown") is not True:
+            raise RuntimeError("Running daemon does not support atomic idle-only shutdown; stop the coordinator before upgrading it")
+    return client.request("POST", "/shutdown", {"idleOnly": idle_only})
+
+
+def _webhook(args: argparse.Namespace, state: Path, port: int) -> int:
+    from .webhooks import ConfigError, add_subscriber, list_config, remove_subscriber
+    if args.action == "list":
+        _emit(list_config(state))
+        return 0
+    if args.action == "test":
+        try:
+            result = Client(state, port).request("POST", "/webhooks/test", {"event": args.event})
+        except RuntimeError:
+            raise RuntimeError("Webhook test unavailable; check daemon status and configuration") from None
+        _emit(result)
+        return 0 if result["configured"] == result["delivered"] else 1
+    if args.action == "add":
+        if sys.stdin.isatty():
+            raise ConfigError("Supply subscriber JSON through a private file or non-interactive pipe")
+        try:
+            raw = sys.stdin.read(1048577)
+            if len(raw) > 1048576:
+                raise ValueError()
+            subscriber = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise ConfigError("Subscriber input must be a JSON object of at most 1 MiB") from None
+        if not isinstance(subscriber, dict):
+            raise ConfigError()
+        if args.subscriber_id is not None:
+            subscriber["id"] = args.subscriber_id
+        result = add_subscriber(state, subscriber)
+    else:
+        result = remove_subscriber(state, args.subscriber_id)
+    try:
+        Client(state, port).request("POST", "/webhooks/reload", {})
+        result["runtime_reload"] = True
+    except RuntimeError:
+        result["runtime_reload"] = False
+    _emit(result)
+    return 0
 
 
 def _await_shutdown(state: Path) -> None:
@@ -313,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "daemon":
             return _daemon(args, state, port)
+        if args.command == "webhook":
+            return _webhook(args, state, port)
         client = Client(state, port)
         if args.command == "session":
             base = f"/sessions/{_encoded(args.id)}" if hasattr(args, "id") else "/sessions"
@@ -347,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action in {"run", "close", "new"}:
                 body = {"message": args.message} if args.action == "run" else (
                     {"interrupt": args.interrupt} if args.action == "close" else {})
+                if args.action == "run" and args.label is not None:
+                    body["label"] = args.label
                 result = client.request("POST", f"/lanes/{_encoded(args.id)}/{args.action}", body)
                 _emit(result)
                 if args.action == "run" and not args.detach:
@@ -370,7 +442,10 @@ def main(argv: list[str] | None = None) -> int:
             _emit(client.request("POST", route, body))
             return 0
         if args.command == "turn":
-            job = client.request("POST", f"/sessions/{_encoded(args.session)}/turn", {"message": args.message})
+            body = {"message": args.message}
+            if args.label is not None:
+                body["label"] = args.label
+            job = client.request("POST", f"/sessions/{_encoded(args.session)}/turn", body)
             _emit(job)
             return 0 if args.detach else _wait(client, job["id"], args.max_hours, args.interrupt_at_deadline)
         if args.command == "wait":

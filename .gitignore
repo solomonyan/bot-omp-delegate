@@ -13,3 +13,7 @@ __pycache__/
 auth.json
 credentials*.json
 token
+webhooks.json
+webhooks.env
+webhooks.lock
+.webhooks.*.tmp

@@ -23,7 +23,7 @@ Keep this directory in place; add the absolute `scripts` directory to your shell
 
 ## Use with an existing project
 
-Grok provides the task; the delegate starts the installed OMP client in the target project's working directory. OMP loads its own global setup and the project's configuration and instructions, performs the work, and returns questions or results through the delegate.
+Grok provides the task; the delegate starts the installed OMP client in the target project's working directory. The Grok Mac app alone does not establish that it can execute local commands: use an executor with the CLI installed and access to the daemon, OMP, and project files. OMP loads its own global setup and project instructions, performs the work, and returns questions or results.
 
 ```mermaid
 flowchart LR
@@ -35,49 +35,53 @@ flowchart LR
     B -->|CLI waiter report| A
 ```
 
-Run these commands on the machine that has both OMP and the target project:
+## Routine lane workflow
+
+Create one lane per existing worktree. Lane creation records a fresh conversation without starting OMP:
 
 ```sh
-PROJECT=/absolute/path/to/your-project
-
-omp-delegate daemon start
-omp-delegate session create --name grok-yourproject-coding --cwd "$PROJECT"
-
-# Replace SESSION_ID with the id from the create response:
-omp-delegate turn SESSION_ID \
-  "Investigate the issue. Follow the project instructions, implement the fix and verify it. Do not commit or push."
+PROJECT=/absolute/path/to/worktree
+omp-delegate lane create --name project --cwd "$PROJECT"
+omp-delegate lane list
+omp-delegate lane show LANE_ID
+omp-delegate lane run LANE_ID "Investigate and implement the requested change"
 ```
 
-Give Grok the absolute delegate CLI path, the target project path, the returned session ID, and the included [delegation skill](skills/bot-omp-delegate/SKILL.md). Grok sends subsequent tasks to the same session ID to retain that conversation's context.
+`lane run` returns a job handle, then waits in the foreground by default. Keep its ID for `read`, `wait`, `steer`, `answer`, or `interrupt`; use one waiter per job. `--detach` returns immediately. A closed available conversation automatically reopens on the next run. Completion retains the conversation; prompts are never replayed after interruption or daemon restart.
 
-This is a separate OMP conversation: it does not inherit an existing interactive chat's history or unsaved session overrides. It reuses discoverable configuration, not another chat's memory. A foreground waiter reports the result and escalates questions for a separate coordinator command to answer.
-
-**Same-machine access is required by default.** Grok must be able to execute the CLI where OMP and the project reside. A cloud-only Grok Bot cannot automatically access OMP on your laptop. This project provides no remote tunnel; any remote execution connection must be separately configured and secured. Do not expose the daemon port publicly.
-
-`turn` prints an initial JSON job record immediately, then blocks until the session settles. The final JSON contains `status`, `finalMessage`, `error`, session/job IDs and timestamps. It is JSONL, not one combined JSON document. Do not equate the initial `running` response with successful completion.
+Foreground `lane run` and `turn` write an initial job record, then a final record: stdout is JSONL, not one combined JSON document. `wait` returns the final record. Exit codes are 0 completed, 1 error, 2 aborted/interrupted, and 3 waiter deadline. A deadline leaves work running unless `--interrupt-at-deadline` was explicitly selected. Reconnect using the original job handle; do not resubmit the task.
 
 ```sh
-omp-delegate session list
-omp-delegate turn SESSION_ID "Next task" --detach
-omp-delegate read JOB_ID
-omp-delegate wait JOB_ID --max-hours 6
-omp-delegate events JOB_ID --after 0
-omp-delegate steer JOB_ID "Preserve the existing public interface"
-omp-delegate interrupt JOB_ID
-omp-delegate session compact SESSION_ID
-omp-delegate daemon stop
-omp-delegate daemon restart
+omp-delegate lane close LANE_ID
+omp-delegate lane close LANE_ID --interrupt
+omp-delegate lane new LANE_ID
 ```
 
-Event pagination uses a zero-based inclusive `--after`; pass the response's `next` as the following cursor. Events and private worker stderr logs persist under the state directory. There is no automatic transcript or job retention policy; monitor disk usage. Changed-file claims come from the worker's actual verification, not a daemon-generated Git status snapshot that would conflate pre-existing changes.
+Default close only closes an idle settled worker. Close preserves the conversation; `lane new` explicitly creates a fresh conversation after settlement and preserves old history. Use separate worktrees for parallel jobs.
 
-`wait` and foreground `turn` exit 0 for completed, 1 for an error, 2 for aborted/interrupted, 3 for the local wait deadline. At the deadline the job keeps running unless `--interrupt-at-deadline` is supplied. A disconnected waiter does not cancel or resubmit a job. Use `read`/`wait` with the original job ID.
+Existing commands remain available: `session create/list/compact`, `turn SESSION MESSAGE`, `wait/read/events/steer/interrupt/answer JOB`. `turn` remains direct session dispatch; lanes are the routine interface.
+
+## Advanced lifecycle
+
+Use `session show/open/close/archive/unarchive/configure/delete ID` and `session list --archived` for explicit session operations. `open` optionally prewarms. Archive preserves history but disables dispatch; close leaves a conversation available for resumption. Configure while settled; reopened workers use the changed options without erasing history. `lane assign` requires `--expected-revision`; `lane delete` removes only its registration.
+
+Deletion requires `--confirm-id` matching the session ID, and is restricted to archived, stopped, unassigned sessions. Purge affects delegate-owned session/job/event/log data, retaining minimal lane-history identity. It never deletes project files, worktrees, branches, provider history, credentials, or unrelated state. Filesystem removal is not secure erasure and cannot remove prior backups or exports.
+
+Lane labels are coordination metadata, not authorization: clients sharing a daemon token share control. Subagent commands (`agent list/read/steer/cancel JOB ...`) use a parent job and child ID; cancellation is not a hard OS kill. Descendant cleanup depends on OMP support; detached tools, external effects, or unrelated processes may outlive shutdown.
+
+## Upgrading existing state
+
+Finish or explicitly interrupt existing jobs, stop the old daemon, update the code, then start the daemon with the same state directory and port. On first startup, legacy `sessions.json` is migrated into versioned `state.json`; session/job IDs, transcripts and options are preserved. The legacy metadata file is removed only after the new state is written. Existing sessions are not assigned to lanes automatically: create a lane and explicitly adopt a saved session with `lane assign` if needed.
+
+Worker processes are runtime resources, not persisted conversations. After restart, workers start stopped and unfinished jobs remain interrupted/aborted; no prompts are replayed. Archived state and lane assignment/history persist. Failed cleanup keeps a worker quarantined rather than admitting a replacement writer. An interrupted purge is recovered on the next startup.
+
+Do not run an older version against a migrated state directory: it does not understand the new metadata. There is no automatic idle timeout or transcript expiration. Grok decides when to close workers; deletion is a separate, explicit operation.
 
 ## Reuse your OMP setup
 
 Workers run the installed `omp` with its inherited environment and the target project's `--cwd`. OMP discovers global credentials, skills, extensions, custom tools and configured models, plus target-project configuration such as `.omp/config.yml` and instructions such as `AGENTS.md`. Project-local setup applies to that target project; it is not exported to unrelated projects. Provider credentials are neither copied into this repository nor returned to Grok by the delegate. An explicitly permitted tool can still access files available to the OS user; the delegate is not a credential-isolation sandbox.
 
-Session creation accepts `--model`, `--thinking`, `--profile`, repeated `--config` and `--add-dir`, and `--tools`. Configuration/additional-directory paths must be absolute and already exist. Options are saved with the delegate session; create a differently named session to change them. A profile selects that profile's credentials/configuration, not the default profile's.
+Session and lane creation accept `--model`, `--thinking`, `--profile`, repeated `--config` and `--add-dir`, and `--tools`. `--config` and `--add-dir` paths must be absolute and already exist; relative paths are rejected. Options are saved with the session; use `session configure ID` while settled to change them. A profile selects that profile's credentials/configuration, not the default profile's.
 
 RPC pins some OMP defaults differently from interactive mode, notably task isolation/execution, memory, advisor and async behavior. Explicit OMP global/project configuration and overlays remain authoritative. This delegate preserves discovery; it does not promise that an RPC worker behaves identically to the current interactive chat. Tools needing interactive MCP login must be authenticated separately before delegation.
 
@@ -108,15 +112,15 @@ omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","answers":[{"id":"db","
 omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","cancelled":true}'
 ```
 
-There is no auto-answer or auto-approval in the delegate. OMP's own dialog timeout behavior still applies; in particular an `ask` timeout can choose recommended/first options. See the pending request's timeout. To permit unattended changes, the owner can explicitly select `session create --approval-mode write` or `yolo`; those are broader authority, not sandbox modes. A waiter must alert its coordinator when input is needed rather than independently making approval/product decisions.
+There is no auto-answer or auto-approval in the delegate. OMP's own dialog timeout behavior still applies; in particular an `ask` timeout can choose recommended/first options. The coordinator resolves questions or obtains owner approval before answering. See the pending request timeout. To permit unattended changes, the owner can explicitly select `session create --approval-mode write` or `yolo`; those are broader authority, not sandbox modes. A waiter escalates input needs and makes no approval/product decisions.
 
 ## Grok Bot workflow
 
 Load [`skills/bot-omp-delegate/SKILL.md`](skills/bot-omp-delegate/SKILL.md) into Grok Bot's skills. Give Grok the installed absolute `omp-delegate` path and target project path.
 
-One low-effort waiter subagent runs the blocking `turn` command in a foreground Shell call. If the platform returns a still-running shell handle, the waiter uses consecutive foreground waits on **that same handle**, not another turn submission. The main bot remains free and gets a single completion report. If a question appears, the waiter escalates it while preserving the active foreground wait.
+One low-effort waiter subagent runs the blocking `lane run` command in a foreground Shell call. If the platform returns a still-running shell handle, the waiter uses consecutive foreground waits on **that same handle**, not another turn submission. The main bot remains free and gets a single completion report. If a question appears, the waiter escalates it while preserving the active foreground wait.
 
-This project does not install Grok, provision a cloud computer, tunnel to your Mac, or copy your OMP login to a cloud host. The daemon must run where OMP and the target files are accessible. A foreground waiter can keep a cloud platform active only if that platform counts foreground waits as activity; verify that behavior on your Grok environment. There is no portable promise that a detached process prevents machine sleep.
+The Grok Mac app does not imply local shell access. Run the waiter in an executor that has this CLI and can reach the local daemon, OMP installation, and worktree.
 
 ## Lifecycle and safety
 
@@ -141,5 +145,3 @@ Provider credentials stay with each operator's OMP installation. That is not a g
 ```sh
 python3 -m unittest discover -s tests -v
 ```
-
-The public transport is authenticated HTTP, not Codex WebSocket JSON-RPC. `server.py` owns state and lifecycle; `worker.py` owns OMP's stdio framing, command correlation and child process; `cli.py` owns coordinator commands and foreground waits.

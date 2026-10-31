@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bot_omp_delegate.server import Conflict, Store
+from bot_omp_delegate.lifecycle import Conflict, Store
 
 
 class LifecycleTests(unittest.TestCase):

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Job-recorded spawning-coordinator subscriber ownership (`--coordinator-subscriber-id`): one completion enqueue through existing private webhooks, preserving failure-filter and outer-loop routing. Retries remain best-effort and receiver-deduplicated.
+- Keep recognized routine tool/session confirmations harness-local without auto-approval; preserve effect-bearing approval contexts, human decisions, errors, deadlines and stalls.
 - Best-effort outbound webhook notifications with private configuration, filters, HMAC signing, bounded retries, sanitized receipts and explicit connectivity testing.
 - Versioned run completion/error/deadline/input/stall, optional lane-idle and daemon-start events, ticket labels, and atomic idle-only daemon stop/restart.
 - Persistent lanes with compact create/list/show/run/close/new workflows. Closed workers lazily resume the same conversation; new conversations retain previous history.

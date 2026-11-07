@@ -11,6 +11,8 @@ omp-delegate answer JOB_ID --json '{"id":"UI_ID","confirmed":false}'
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","answers":[{"id":"QUESTION_ID","selectedOptions":["EXACT LABEL"]}]}'
 ```
 
+Routine `confirm` dialogs using session-scoped Approve/Allow task/eval wording or OMP's “Approve this call” title stay harness-local when their request context has no spend, production, merge, secret or other external-effect decision. Inspect/answer `pendingInput` through the existing control path; filtering never grants permission. Unknown confirmations, human questions and effect-bearing approval context still emit `run.needs_input` once per pending dialog ID.
+
 ## Session lifecycle
 
 - `session show ID` inspects a snapshot; `session list --archived` includes archived records.
@@ -46,6 +48,16 @@ Cancellation is an OMP control request, not an OS-level hard kill. Descendant cl
 ## Outbound webhooks
 
 Load this reference when configuring notifications, diagnosing delivery, or implementing a receiver. Notifications are asynchronous best-effort signals; they never make a task durable or invoke a model. The bounded queue can drop events when full, shutdown can discard queued work, and retries can produce duplicates. Use job state as the source of truth and deduplicate deliveries.
+
+### Spawning-coordinator ownership
+
+For a completion wake, pass `--coordinator-subscriber-id ID` with `lane run` or direct `turn`; HTTP dispatch uses `coordinator_subscriber_id`. The ID must already exist in private webhook configuration and is saved on the job, not inferred from a lane, label or global default. Use the spawning Grok coordinator's existing receiver path.
+
+When that job settles as `completed`, its owner is included once in the existing `run.done` enqueue, bypassing its generic event/lane filters. Ordinary matching subscribers, including a completed-failure filter, remain selected; an owner already selected by filters is not duplicated. A job without an owner has no additional completion route. Non-completion events keep ordinary filtering.
+
+Wake-once is sender-side enqueue idempotency, not durable exactly-once delivery. A Grok coordinator should deduplicate `X-OMP-Delivery` retries and ignore a repeated `{job_id}:run.done` business key before supervising or starting its next unit. No relay bot or new receiver service is required. Source updates need a later operator-controlled daemon restart; config reload alone cannot activate code.
+
+For MELCHIOR's existing deployment, the owner is `melchior-fail-completions`: its `coordinator-2026-11-07` gate forwards completions to `melchior-lane-events` and the Grok wellness-ops lane-events routine. Keep that gate in the path. It claims each `job_id` under a file lock before POST, drops duplicate finishes, and does not automatically retry an ambiguous failed forward. It forwards errors, deadlines, stalls and human decisions without the finish ledger. No production receiver, ledger or webhook configuration is changed by installing this source.
 
 ### Private configuration
 
@@ -101,7 +113,7 @@ Supported event names:
 | `daemon.up` | Daemon started serving. |
 | `run.done` | A job completed. |
 | `run.error` | A job errored, was aborted, or was interrupted. |
-| `run.needs_input` | A newly pending dialog needs a coordinator answer; emitted once per pending dialog ID. |
+| `run.needs_input` | A newly pending human-decision dialog needs an answer; routine harness approvals are excluded. Emitted once per pending dialog ID. |
 | `run.stalled` | A running job produced no output for the configured threshold; skipped while waiting for input and suppressed until new output resumes. |
 | `run.deadline` | A CLI waiter reached its deadline; the underlying job may continue and is not cancelled by this event. |
 | `lane.idle` | Optional notification for an idle episode. |

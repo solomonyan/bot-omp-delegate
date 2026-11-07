@@ -351,10 +351,14 @@ class Store:
                     self._save_state()
             raise
 
-    def turn(self, sid, message, label=None):
+    def turn(self, sid, message, label=None, coordinator_subscriber_id=None):
         message = text({"message": message}, "message")
         if label is not None and (not isinstance(label, str) or not label.strip() or len(label) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in label)):
             raise ValueError("label must be non-empty, at most 200 characters and contain no control characters")
+        if coordinator_subscriber_id is not None:
+            dispatcher = self.notifications.dispatcher
+            if dispatcher is None or not dispatcher.has_subscriber(coordinator_subscriber_id):
+                raise ValueError("coordinator_subscriber_id must identify an existing webhook subscriber")
         with self.cv:
             session = self.session(sid)
             self._available(session)
@@ -364,6 +368,8 @@ class Store:
                    "nextSeq": 0, "workerGeneration": session["worker"]["generation"]}
             if label is not None:
                 job["label"] = label
+            if coordinator_subscriber_id is not None:
+                job["coordinator_subscriber_id"] = coordinator_subscriber_id
             self.jobs[jid] = job
             session.update(activeJob=jid, lastJob=jid, lastActivity=time.time())
             session["worker"]["state"] = "busy" if sid in self.ready else "starting"
@@ -757,7 +763,8 @@ class Store:
             sid = lane["sessionId"]
             session = self.session(sid)
             if action == "run":
-                job = self.turn(sid, text(data, "message"), label=data.get("label"))
+                job = self.turn(sid, text(data, "message"), label=data.get("label"),
+                                coordinator_subscriber_id=data.get("coordinator_subscriber_id"))
                 job["laneId"] = lid
                 self.jobs[job["id"]]["laneId"] = lid
                 self._save_job(self.jobs[job["id"]])

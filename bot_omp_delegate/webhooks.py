@@ -308,6 +308,11 @@ class WebhookDispatcher:
         with self._lock:
             return bool(self._config["subscribers"]) and not self._config_error and not self._closed
 
+    def has_subscriber(self, subscriber_id):
+        with self._lock:
+            return (isinstance(subscriber_id, str) and not self._config_error and not self._closed
+                    and any(s["id"] == subscriber_id for s in self._config["subscribers"]))
+
     @property
     def settings(self):
         with self._lock:
@@ -326,11 +331,20 @@ class WebhookDispatcher:
             self._config, self._config_error = config, None
         return self.public_config()
 
-    def _prepare(self, payload, bypass_filters=False):
+    def _prepare(self, payload, bypass_filters=False, coordinator_subscriber_id=None):
         with self._lock:
             if self._config_error:
                 raise _invalid()
-            subscribers = [s for s in self._config["subscribers"] if bypass_filters or ((not s.get("events") or payload["event"] in s["events"]) and (not s.get("lanes") or payload.get("lane") in s["lanes"] or payload.get("lane_id") in s["lanes"]))]
+            # Explicit completion ownership is independent of broadcast filters.
+            # A union, rather than a second emit, prevents duplicate owner enqueues.
+            subscribers = [
+                s for s in self._config["subscribers"]
+                if bypass_filters
+                or (payload["event"] == "run.done" and s["id"] == coordinator_subscriber_id)
+                or ((not s.get("events") or payload["event"] in s["events"])
+                    and (not s.get("lanes") or payload.get("lane") in s["lanes"]
+                         or payload.get("lane_id") in s["lanes"]))
+            ]
             safe = dict(payload, version=1)
             summary = str(safe.get("summary", ""))
             # Redact before truncation; otherwise a credential can straddle char 300.
@@ -356,10 +370,10 @@ class WebhookDispatcher:
                     if batch:
                         batch.complete(index, {"subscriber_id": subscriber["id"], "delivered": False, "status_code": None, "attempts": 0, "error": "queue_full"})
 
-    def emit(self, payload):
+    def emit(self, payload, coordinator_subscriber_id=None):
         try:
             if self.enabled:
-                self._submit(*self._prepare(payload))
+                self._submit(*self._prepare(payload, coordinator_subscriber_id=coordinator_subscriber_id))
         except Exception:
             # Delivery is never allowed to alter a lane's state or expose exceptions.
             self._dropped += 1

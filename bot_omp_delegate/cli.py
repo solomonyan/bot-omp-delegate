@@ -183,6 +183,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--max-hours", type=float, default=6)
     run.add_argument("--interrupt-at-deadline", action="store_true")
     run.add_argument("--label")
+    run.add_argument("--coordinator-subscriber-id", help="existing webhook subscriber that owns this job's completion wake")
     close_lane = lanes.add_parser("close")
     close_lane.add_argument("id")
     close_lane.add_argument("--interrupt", action="store_true")
@@ -214,6 +215,7 @@ def _parser() -> argparse.ArgumentParser:
     turn.add_argument("--max-hours", type=float, default=6)
     turn.add_argument("--interrupt-at-deadline", action="store_true")
     turn.add_argument("--label")
+    turn.add_argument("--coordinator-subscriber-id", help="existing webhook subscriber that owns this job's completion wake")
     wait = subs.add_parser("wait", help="wait for a job to finish")
     wait.add_argument("job")
     wait.add_argument("--max-hours", type=float, default=6)
@@ -419,6 +421,8 @@ def main(argv: list[str] | None = None) -> int:
                     {"interrupt": args.interrupt} if args.action == "close" else {})
                 if args.action == "run" and args.label is not None:
                     body["label"] = args.label
+                if args.action == "run" and args.coordinator_subscriber_id is not None:
+                    body["coordinator_subscriber_id"] = args.coordinator_subscriber_id
                 result = client.request("POST", f"/lanes/{_encoded(args.id)}/{args.action}", body)
                 _emit(result)
                 if args.action == "run" and not args.detach:
@@ -445,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
             body = {"message": args.message}
             if args.label is not None:
                 body["label"] = args.label
+            if args.coordinator_subscriber_id is not None:
+                body["coordinator_subscriber_id"] = args.coordinator_subscriber_id
             job = client.request("POST", f"/sessions/{_encoded(args.session)}/turn", body)
             _emit(job)
             return 0 if args.detach else _wait(client, job["id"], args.max_hours, args.interrupt_at_deadline)

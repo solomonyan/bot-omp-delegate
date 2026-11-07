@@ -351,10 +351,14 @@ class Store:
                     self._save_state()
             raise
 
-    def turn(self, sid, message, label=None):
+    def turn(self, sid, message, label=None, coordinator_subscriber_id=None):
         message = text({"message": message}, "message")
         if label is not None and (not isinstance(label, str) or not label.strip() or len(label) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in label)):
             raise ValueError("label must be non-empty, at most 200 characters and contain no control characters")
+        if coordinator_subscriber_id is not None:
+            dispatcher = self.notifications.dispatcher
+            if dispatcher is None or not dispatcher.has_subscriber(coordinator_subscriber_id):
+                raise ValueError("coordinator_subscriber_id must identify an existing webhook subscriber")
         with self.cv:
             session = self.session(sid)
             self._available(session)
@@ -364,6 +368,8 @@ class Store:
                    "nextSeq": 0, "workerGeneration": session["worker"]["generation"]}
             if label is not None:
                 job["label"] = label
+            if coordinator_subscriber_id is not None:
+                job["coordinator_subscriber_id"] = coordinator_subscriber_id
             self.jobs[jid] = job
             session.update(activeJob=jid, lastJob=jid, lastActivity=time.time())
             session["worker"]["state"] = "busy" if sid in self.ready else "starting"
@@ -473,6 +479,9 @@ class Store:
                     job["finalMessage"] = "\n".join(p.get("text", "") for p in message.get("content", []) if p.get("type") == "text")
                     changed = True
             elif kind == "prompt_result" and frame.get("id") == jid:
+                # A prompt can yield while native tasks still own pending result
+                # deliveries. OMP wakes this same parent session itself; retain
+                # the job/worktree until session_settled, without a relay prompt.
                 job["resultStatus"] = frame.get("status", "error")
                 job["resultError"] = frame.get("error")
                 if frame.get("sessionSettled"):
@@ -757,7 +766,8 @@ class Store:
             sid = lane["sessionId"]
             session = self.session(sid)
             if action == "run":
-                job = self.turn(sid, text(data, "message"), label=data.get("label"))
+                job = self.turn(sid, text(data, "message"), label=data.get("label"),
+                                coordinator_subscriber_id=data.get("coordinator_subscriber_id"))
                 job["laneId"] = lid
                 self.jobs[job["id"]]["laneId"] = lid
                 self._save_job(self.jobs[job["id"]])

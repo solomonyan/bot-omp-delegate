@@ -2,7 +2,30 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+import re
 import time
+
+
+_SESSION_APPROVAL = re.compile(
+    r"(?:(?:approve|allow) (?:task|eval)|allow[- ](?:tool|eval)(?: (?:task|eval))?) "
+    r"for (?:this|the) session[?.!]?", re.I)
+# Keep external-effect decisions visible, matching the coordinator receiver gate.
+_EXTERNAL_EFFECT = re.compile(
+    r"\b(?:spend|pay|payment|purchase|buy|charge|billing|cost|budget|prod|production|"
+    r"deploy|release|publish|merge|squash|ready_for_review|github|git push|"
+    r"secret|credential|token|password|tunnel|whatsapp|send|email|delete|"
+    r"classification|solomon|sign[- ]?off)\b", re.I)
+
+
+def _is_routine_approval(request):
+    if request.get("method") != "confirm" or not isinstance(request.get("title"), str):
+        return False
+    title = request["title"].strip()
+    # Match the existing receiver's session-scoped gate, not generic tool
+    # confirmations: a tool-call title alone does not establish routine work.
+    return bool(_SESSION_APPROVAL.fullmatch(title)) and not _EXTERNAL_EFFECT.search(
+        json.dumps(request, ensure_ascii=False))
 
 
 class Notifications:
@@ -33,7 +56,11 @@ class Notifications:
             payload["label"] = job["label"]
         try:
             # Only bounded enqueue is allowed here: caller may hold Store.cv.
-            self.dispatcher.emit(payload)
+            owner = job.get("coordinator_subscriber_id") if event == "run.done" else None
+            if owner is None:
+                self.dispatcher.emit(payload)
+            else:
+                self.dispatcher.emit(payload, coordinator_subscriber_id=owner)
         except Exception:
             # Notification failure must not change an agent's outcome. No exception
             # text is logged because transports can embed secret endpoint values.
@@ -90,6 +117,8 @@ class Notifications:
             if not ui_id or ui_id in state["input_ids"]:
                 continue
             state["input_ids"].add(ui_id)
+            if _is_routine_approval(request):
+                continue
             questions = request.get("questions")
             first = questions[0] if isinstance(questions, list) and questions and isinstance(questions[0], dict) else {}
             summary = request.get("title") or first.get("question") or "Question or approval requires input"

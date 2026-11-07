@@ -30,13 +30,26 @@ Changes are saved locally first. The CLI then attempts a runtime reload; if the 
 
 Events describe lifecycle facts: `daemon.up`, `run.done`, `run.error`, `run.needs_input`, `run.stalled`, `run.deadline`, and optional `lane.idle`. A waiter deadline means the waiter stopped waiting; it does not mean the task was cancelled. Stall means no new output for the configured interval, not proof of deadlock. Notifications do not invoke a model or alter task policy.
 
-An `events` filter selects event names; a `lanes` filter selects lane names or lane IDs. Omitted filters receive all applicable events. Lane and job fields are empty for daemon-level events and unassigned sessions. `run.needs_input` is emitted once for a newly pending input request; stall alerts are suppressed until output resumes, then may fire again. Deadline alerts do not cancel work.
+An `events` filter selects event names; a `lanes` filter selects lane names or lane IDs. Omitted filters receive all applicable events. Lane and job fields are empty for daemon-level events and unassigned sessions. `run.needs_input` is emitted once for a newly pending human decision; recognized routine tool/session approvals stay pending in the harness without a webhook or automatic answer. Stall alerts are suppressed until output resumes, then may fire again. Deadline alerts do not cancel work.
 
 Requests are JSON with an `X-OMP-Event` header and stable `X-OMP-Delivery` identifier across retries. When `hmac_secret` is configured, the signature header carries `sha256=` followed by the hexadecimal HMAC-SHA256 of the exact request body bytes. Receivers should verify the signature against the raw body before parsing JSON and deduplicate retries using the delivery identifier. Authentication headers are optional and configured per subscriber.
 
 The daemon retries transient network failures and non-2xx responses with bounded backoff. It avoids redirects and environment-configured proxies; response bodies and credential-bearing values are not exposed in CLI receipts. Notifications are an operational convenience, not a durable event log or a replacement for querying job state.
 
 For the complete event payload, configuration schema, and operational limits, see [`skills/bot-omp-delegate/advanced.md`](skills/bot-omp-delegate/advanced.md).
+
+### Spawning-coordinator completion wake
+
+Pass `--coordinator-subscriber-id ID` to `lane run` or `turn` to record an existing, non-secret webhook subscriber ID on that job (`coordinator_subscriber_id` in HTTP requests). On completion, that owner receives the existing `run.done` payload even if its generic event/lane filters exclude it. Selection is a union without duplicate owner enqueues. Generic non-MELCHIOR completion subscribers keep ordinary filtering, but `melchior-fail-completions` receives an ordinary match only for completed-fail summaries. Errors, deadlines, stalls and human decisions keep their existing routes.
+
+“Wake once” means one completion enqueue per settled job, not exactly-once HTTP delivery. Deduplicate retries by `X-OMP-Delivery` and treat `{job_id}:run.done` as the completion business key before starting the next unit. Delivery remains best-effort; no receiver service or model invocation is added here.
+
+For the existing MELCHIOR installation, record `melchior-fail-completions` as the owner only when MELCHIOR spawned the job. Healthy ownerless jobs and healthy jobs owned by another subscriber do not select that gate. Completed-fail jobs retain its ordinary completion-gate route, union their recorded owner if any. Its unchanged `coordinator-2026-11-07` receiver forwards selected completions to `melchior-lane-events` → Grok's wellness-ops lane-events routine; it claims `job_id` under `flock` before forwarding, so duplicate finishes and ambiguous failed attempts are not resent. This is at-most-once forwarding, not guaranteed delivery. No live receiver, ledger or configuration is changed.
+
+Completed-fail classification uses the delivered summary after redaction and truncation to 300 characters, not a new job/RPC outcome field. The first line matching `(?im)^\s*Verdict:\s*(FAIL|PASS(?:\+NOTES)?)\b` wins: `FAIL` is completed-fail; `PASS` and `PASS+NOTES` are healthy, even if other failure markers appear. Without a matching Verdict line, only a line-leading `FAIL:`, `FAIL` followed by an em/en/hyphen dash and `P0`–`P3`, the word `BLOCKED`, or `READY.md withheld` marks completed-fail (case-insensitive). Missing/empty summaries and other text, including prose mentioning “fail” or “failed”, are healthy. Exact fallback expressions are in the [advanced reference](skills/bot-omp-delegate/advanced.md#spawning-coordinator-ownership).
+
+These source changes require a later, operator-controlled daemon restart to affect an already-running process; webhook configuration reload alone does not load Python code. Do not restart a live daemon with in-flight work.
+
 Generic integration: each operator uses their own OMP installation, login, configuration and project files. Provider credentials are not bundled with the project.
 
 ## Requirements and setup
@@ -94,6 +107,12 @@ omp-delegate lane new LANE_ID
 
 Default close only closes an idle settled worker. Close preserves the conversation; `lane new` explicitly creates a fresh conversation after settlement and preserves old history. Use separate worktrees for parallel jobs.
 
+### Native parent continuation
+
+OMP delivers native `task` results into the same owning parent session and triggers its next turn in-process. The delegate keeps the worker, parent job and worktree ownership active when `prompt_result` has `sessionSettled: false`; it records the resumed parent's final message and finishes only after `session_settled`. Child completion alone is not a top-level completion webhook. No relay bot, second parent session or extra delegate prompt is involved.
+
+`--continue` preserves conversation identity when reopening an idle worker; it is not the child-result wake mechanism. Interrupted tasks are not silently restored or replayed. Regression coverage uses an offline RPC peer to exercise the delegate boundary; no paid model-backed child-completion run is claimed.
+
 The daemon can send best-effort HTTP notifications for lifecycle events. Notifications are delivered asynchronously; they do not block lane work. A full delivery queue drops notifications, and transient failures receive bounded retries. Delivery is not durable: daemon shutdown or a process failure can lose queued events, while retries can produce duplicate requests. Consumers should deduplicate by `X-OMP-Delivery`.
 
 ### Private configuration and provisioning
@@ -118,7 +137,7 @@ Changes are saved locally first. The CLI then attempts a runtime reload; if the 
 
 Events describe lifecycle facts: `daemon.up`, `run.done`, `run.error`, `run.needs_input`, `run.stalled`, `run.deadline`, and optional `lane.idle`. A waiter deadline means the waiter stopped waiting; it does not mean the task was cancelled. Stall means no new output for the configured interval, not proof of deadlock. Notifications do not invoke a model or alter task policy.
 
-An `events` filter selects event names; a `lanes` filter selects lane names or lane IDs. Omitted filters receive all applicable events. Lane and job fields are empty for daemon-level events and unassigned sessions. `run.needs_input` is emitted once for a newly pending input request; stall alerts are suppressed until output resumes, then may fire again. Deadline alerts do not cancel work.
+An `events` filter selects event names; a `lanes` filter selects lane names or lane IDs. Omitted filters receive all applicable events. Lane and job fields are empty for daemon-level events and unassigned sessions. `run.needs_input` is emitted once for a newly pending human decision; recognized routine tool/session approvals stay pending in the harness without a webhook or automatic answer. Stall alerts are suppressed until output resumes, then may fire again. Deadline alerts do not cancel work.
 
 Requests are JSON with an `X-OMP-Event` header and stable `X-OMP-Delivery` identifier across retries. When `hmac_secret` is configured, the signature header carries `sha256=` followed by the hexadecimal HMAC-SHA256 of the exact request body bytes. Receivers should verify the signature against the raw body before parsing JSON and deduplicate retries using the delivery identifier. Authentication headers are optional and configured per subscriber.
 

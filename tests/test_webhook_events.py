@@ -55,6 +55,13 @@ class EventTests(unittest.TestCase):
         self.event({"type": "session_settled"})
         self.assertEqual(self.names(), ["run.done"])
 
+    def test_completed_failure_text_still_emits_done_notification(self):
+        job = self.run_job()
+        self.event({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "FAIL: task completed with a reported failure"}]}})
+        self.event({"type": "prompt_result", "id": job["id"], "status": "completed", "sessionSettled": True})
+        self.assertEqual(self.names(), ["run.done"])
+        self.assertEqual(self.sink.events[0]["summary"], "FAIL: task completed with a reported failure")
+
     def test_error_aborted_and_interrupted_are_not_success(self):
         for status in ("error", "aborted", "interrupted"):
             with self.subTest(status=status):
@@ -82,6 +89,29 @@ class EventTests(unittest.TestCase):
         self.now += 1
         self.store.monitor_tick()
         self.assertEqual(self.names()[-1], "run.stalled")
+
+    def test_session_task_approval_stays_pending_without_outer_notification(self):
+        job = self.run_job()
+        approval = {"type": "extension_ui_request", "method": "confirm", "id": "session-approval",
+                    "title": "Approve task for this session"}
+        self.event(approval)
+        self.assertEqual(self.store.job(job["id"])["status"], "waiting_input")
+        self.assertEqual(self.store.job(job["id"])["pendingInput"], [approval])
+        self.assertEqual(self.names(), [])
+
+        self.now = 10000
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), [])
+        self.assertEqual(self.store.job(job["id"])["pendingInput"], [approval])
+
+        self.event({"type": "extension_ui_request", "method": "cancel", "targetId": "session-approval"})
+        self.assertEqual(self.store.job(job["id"])["pendingInput"], [])
+        self.now += 1799
+        self.store.monitor_tick()
+        self.assertNotIn("run.stalled", self.names())
+        self.now += 1
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), ["run.stalled"])
 
     def test_stall_threshold_deduplication_and_actual_output_rearms(self):
         job = self.run_job()

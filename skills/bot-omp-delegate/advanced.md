@@ -11,6 +11,8 @@ omp-delegate answer JOB_ID --json '{"id":"UI_ID","confirmed":false}'
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","answers":[{"id":"QUESTION_ID","selectedOptions":["EXACT LABEL"]}]}'
 ```
 
+Routine `confirm` dialogs using the receiver gate's session-scoped Approve/Allow task/eval/tool wording stay harness-local when their request context has no spend, production, merge, secret or other external-effect decision. Inspect/answer `pendingInput` through the existing control path; filtering never grants permission. Unknown confirmations, generic “Approve this call” tool prompts, human questions and effect-bearing approval context still emit `run.needs_input` once per pending dialog ID.
+
 ## Session lifecycle
 
 - `session show ID` inspects a snapshot; `session list --archived` includes archived records.
@@ -43,9 +45,27 @@ omp-delegate agent cancel JOB_ID AGENT_ID
 
 Cancellation is an OMP control request, not an OS-level hard kill. Descendant cleanup depends on OMP's supported behavior; detached tools, external side effects, and unrelated processes may continue. A stale parent job must not be redirected to a successor worker. Use job events and full session history only when the investigation requires them.
 
+Native `task` results wake their owning OMP parent session in-process. A `prompt_result` with `sessionSettled: false` is a yield, not final job completion: the delegate retains the same worker/job and worktree ownership through child-result delivery and resumed parent output, then settles on `session_settled`. Do not relay the result as another prompt or create a second parent session. Reopening with `--continue` is separate conversation persistence, not the result wake path.
+
 ## Outbound webhooks
 
 Load this reference when configuring notifications, diagnosing delivery, or implementing a receiver. Notifications are asynchronous best-effort signals; they never make a task durable or invoke a model. The bounded queue can drop events when full, shutdown can discard queued work, and retries can produce duplicates. Use job state as the source of truth and deduplicate deliveries.
+
+### Spawning-coordinator ownership
+
+For a completion wake, pass `--coordinator-subscriber-id ID` with `lane run` or direct `turn`; HTTP dispatch uses `coordinator_subscriber_id`. The ID must already exist in private webhook configuration and is saved on the job, not inferred from a lane, label or global default. Use the spawning Grok coordinator's existing receiver path.
+
+When a job settles as `completed`, its owner is included once in the existing `run.done` enqueue, bypassing its generic event/lane filters. Generic non-MELCHIOR completion subscribers retain ordinary filtering. The `melchior-fail-completions` gate receives an ordinary match only for completed-fail summaries; healthy jobs select it only when it is their recorded owner. Thus ownerless healthy jobs and healthy jobs owned by another subscriber never fall back to MELCHIOR. Completed-fail jobs retain the ordinary gate match union their owner, without duplicates. Other terminal statuses remain `run.error`; non-completion filtering is unchanged.
+
+Wake-once is sender-side enqueue idempotency, not durable exactly-once delivery. A Grok coordinator should deduplicate `X-OMP-Delivery` retries and ignore a repeated `{job_id}:run.done` business key before supervising or starting its next unit. No relay bot or new receiver service is required. Source updates need a later operator-controlled daemon restart; config reload alone cannot activate code.
+
+For MELCHIOR's existing deployment, record `melchior-fail-completions` as owner when MELCHIOR spawned the job. The sender selects that gate for healthy completions only with this recorded ownership, or for ordinary completed-fail matches regardless of ownership. The unchanged `coordinator-2026-11-07` receiver forwards selected completions to `melchior-lane-events` and the Grok wellness-ops lane-events routine. It claims each `job_id` under a file lock before POST, drops duplicate finishes, and does not automatically retry an ambiguous failed forward. Error/deadline/stalled/human-decision routes remain unchanged. No production receiver, ledger or webhook configuration is changed.
+
+Completed-fail uses the exact payload summary after existing redaction and truncation to 300 characters; no new outcome field is added:
+
+1. The first match of `(?im)^\s*Verdict:\s*(FAIL|PASS(?:\+NOTES)?)\b` wins. `FAIL` is completed-fail; `PASS` or `PASS+NOTES` is healthy and overrides fallback markers anywhere else.
+2. Without a matching Verdict line, completed-fail requires one of these case-insensitive expressions: `(?im)^\s*FAIL:`, `\bFAIL\s+[—–-]\s*P[0-3]\b`, `\bBLOCKED\b`, or `READY\.md withheld`.
+3. Missing, empty and all other summaries are healthy. “Fail” or “failed” in ordinary prose does not suffice.
 
 ### Private configuration
 
@@ -101,7 +121,7 @@ Supported event names:
 | `daemon.up` | Daemon started serving. |
 | `run.done` | A job completed. |
 | `run.error` | A job errored, was aborted, or was interrupted. |
-| `run.needs_input` | A newly pending dialog needs a coordinator answer; emitted once per pending dialog ID. |
+| `run.needs_input` | A newly pending human-decision dialog needs an answer; routine harness approvals are excluded. Emitted once per pending dialog ID. |
 | `run.stalled` | A running job produced no output for the configured threshold; skipped while waiting for input and suppressed until new output resumes. |
 | `run.deadline` | A CLI waiter reached its deadline; the underlying job may continue and is not cancelled by this event. |
 | `lane.idle` | Optional notification for an idle episode. |

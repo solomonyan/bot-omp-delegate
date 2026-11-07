@@ -86,7 +86,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = store.show_session(parts[1])
             elif len(parts) == 3 and parts[0] == "sessions" and post:
                 if parts[2] == "turn":
-                    result = store.turn(parts[1], text(data, "message"), label=data.get("label"))
+                    result = store.turn(parts[1], text(data, "message"), label=data.get("label"),
+                                        coordinator_subscriber_id=data.get("coordinator_subscriber_id"))
                 elif parts[2] == "compact":
                     result = store.compact(parts[1])
                 else:

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix the P1 MELCHIOR happy-completion fallback: the completion gate now requires recorded ownership for healthy jobs, while the VISION-approved first-Verdict/fallback summary grammar preserves ordinary completed-fail alerts. Generic completion subscribers and non-completion/approval routing are unchanged; no outcome field or live configuration change.
 - Preserve native same-parent OMP result delivery through background-work settlement; cover the real Worker/Store boundary with an offline RPC peer, without an extra parent prompt or launch/config change.
 - Job-recorded spawning-coordinator subscriber ownership (`--coordinator-subscriber-id`): one completion enqueue through existing private webhooks, preserving failure-filter and outer-loop routing. Retries remain best-effort and receiver-deduplicated.
 - Keep recognized routine tool/session confirmations harness-local without auto-approval; preserve effect-bearing approval contexts, human decisions, errors, deadlines and stalls.
@@ -12,6 +13,8 @@
 - Versioned legacy-state migration and recoverable scoped purge. Serialize lifecycle transitions, quarantine failed cleanup, and reject stale controls and cross-task child transcript access.
 - Bounded OMP worker/process-group shutdown, including interrupt-close during startup, prewarming, pending questions and active work. Detached/external processes remain outside the guarantee.
 - Concise routine Grok skill with advanced instructions loaded on demand; no frontend, new dependencies, automatic idle timeout or Grok-native telemetry integration.
+
+P1 routing verification: all 89 tests passed with the full suite run in the foreground. Seven offline Store/dispatcher scenarios verified ownerless/other-owner healthy exclusion from the MELCHIOR gate, gate ownership, ownerless/owned completed-fail preservation, generic subscriber preservation, first-Verdict precedence and no duplicate finish enqueue. Regression coverage also checks delivered-summary redaction/truncation boundaries, fallback markers, ordinary “failed” prose and unchanged outer-loop/approval routes. No live daemon/config/receiver was changed.
 
 Continuation/wake verification: `python3 -B -m unittest discover -s tests -v` passed all 83 tests. Separate CLI/HTTP/Worker smoke with an offline RPC peer retained the same parent session and worker process, sent one prompt, captured the resumed result and delivered one completion webhook. A loopback retry smoke against the existing receiver code with temporary state produced two HTTP attempts sharing one delivery UUID and one coordinator forward attempt. No paid model-backed engine run or live Grok endpoint was exercised; the production daemon/config/receiver/ledger were left untouched. Source activation requires a later authorized daemon restart.
 

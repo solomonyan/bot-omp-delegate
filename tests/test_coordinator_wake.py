@@ -60,18 +60,18 @@ class CoordinatorWakeTests(unittest.TestCase):
     def selected(self, event):
         return [(payload, ids) for payload, ids in self.enqueued if payload["event"] == event]
 
-    def test_completion_wakes_owner_and_fail_filter_once_but_not_other_subscribers(self):
+    def test_healthy_completion_wakes_only_recorded_owner_once(self):
         job = self.run_job("spawning-coordinator")
         self.finish(job)
         done = self.selected("run.done")
         self.assertEqual(len(done), 1)
-        self.assertEqual(done[0][1], ["melchior-fail-completions", "spawning-coordinator"])
+        self.assertEqual(done[0][1], ["spawning-coordinator"])
         self.assertNotIn("other-coordinator", done[0][1])
         self.finish(job)
         self.store.event(self.sid, {"type": "session_settled"})
         self.assertEqual(len(self.selected("run.done")), 1)
 
-    def test_ordinary_done_match_and_explicit_owner_are_unioned_without_duplicates(self):
+    def test_healthy_completion_owned_by_gate_selects_gate_once(self):
         job = self.run_job("melchior-fail-completions")
         self.finish(job)
         self.assertEqual(self.selected("run.done")[0][1], ["melchior-fail-completions"])
@@ -79,7 +79,7 @@ class CoordinatorWakeTests(unittest.TestCase):
     def test_no_owner_adds_no_completion_wake(self):
         job = self.run_job()
         self.finish(job)
-        self.assertEqual(self.selected("run.done")[0][1], ["melchior-fail-completions"])
+        self.assertEqual(self.selected("run.done")[0][1], [])
 
     def test_noncompletion_events_keep_lane_routes_and_routine_approval_pending(self):
         errored = self.run_job("spawning-coordinator")
@@ -162,6 +162,84 @@ class CoordinatorWakeTests(unittest.TestCase):
         done = self.selected("run.done")[-1]
         self.assertIn("FAIL: task completed with a reported failure", done[0]["summary"])
         self.assertEqual(done[1], ["melchior-fail-completions", "spawning-coordinator"])
+
+    def test_ownerless_completed_failure_still_reaches_gate(self):
+        job = self.run_job()
+        self.store.event(self.sid, {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Verdict: FAIL"},
+        ]}})
+        self.finish(job)
+        payload, ids = self.selected("run.done")[-1]
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(ids, ["melchior-fail-completions"])
+
+    def test_approved_failure_grammar_and_first_verdict_precedence(self):
+        cases = [
+            ("", False),
+            ("An earlier attempt failed; the fix is now verified.", False),
+            ("Do not fail the completed task.", False),
+            ("Notes\n  vErDiCt: fAiL\nDetails", True),
+            ("Verdict: FAIL\nVerdict: PASS", True),
+            ("Verdict: PASS\nVerdict: FAIL", False),
+            ("Verdict: PASS+NOTES\nVerdict: FAIL\nBLOCKED", False),
+            ("FAIL: earlier attempt\nVerdict: PASS", False),
+            ("FAIL: task completed with a reported failure", True),
+            ("Details\n  fail: verification missing", True),
+            ("Quoted inline FAIL: is not a line-leading marker", False),
+            ("FAIL — P0", True),
+            ("fail – p1", True),
+            ("FAIL - P3", True),
+            ("FAIL - P4", False),
+            ("FAIL - P30", False),
+            ("Work is bLoCkEd pending input", True),
+            ("Work is unblocked", False),
+            ("ready.MD withheld pending verification", True),
+            ("READYxmd withheld", False),
+            ("Narrative Verdict: PASS\nFAIL: verification failed", True),
+            ("Verdict: FAILURE", False),
+        ]
+        for summary, failed in cases:
+            with self.subTest(summary=summary):
+                job = self.run_job()
+                self.store.event(self.sid, {"type": "message_end", "message": {
+                    "role": "assistant", "content": [{"type": "text", "text": summary}],
+                }})
+                self.finish(job)
+                payload, ids = self.selected("run.done")[-1]
+                self.assertEqual(payload["status"], "completed")
+                self.assertEqual(ids, ["melchior-fail-completions"] if failed else [])
+
+    def test_completion_gate_uses_truncated_payload_summary(self):
+        for prefix_length, failed in [(294, True), (295, False), (300, False)]:
+            with self.subTest(prefix_length=prefix_length):
+                summary = "x" * prefix_length + "\nFAIL:"
+                envelope, subscribers = self.dispatcher._prepare({"event": "run.done", "summary": summary})
+                self.assertEqual(envelope.payload["summary"], summary[:300])
+                self.assertEqual([s["id"] for s in subscribers],
+                                 ["melchior-fail-completions"] if failed else [])
+
+    def test_completion_gate_uses_redacted_payload_summary(self):
+        add_subscriber(self.root, {"id": "redaction-source", "url": "https://example.invalid/hook",
+                                   "events": ["daemon.up"], "hmac_secret": "BLOCKED"})
+        self.dispatcher.reload()
+        envelope, subscribers = self.dispatcher._prepare({"event": "run.done", "summary": "BLOCKED"})
+        self.assertEqual(envelope.payload["summary"], "[redacted]")
+        self.assertEqual(subscribers, [])
+
+    def test_generic_completion_subscribers_remain_selected_for_missing_summary(self):
+        add_subscriber(self.root, {"id": "generic-audit", "url": "https://example.invalid/hook",
+                                   "events": ["run.done"], "lanes": ["coding"]})
+        self.dispatcher.reload()
+        _, subscribers = self.dispatcher._prepare({"event": "run.done", "lane": "coding"})
+        self.assertEqual([s["id"] for s in subscribers], ["generic-audit"])
+
+    def test_completed_failure_owner_is_gate_is_not_duplicated(self):
+        job = self.run_job("melchior-fail-completions")
+        self.store.event(self.sid, {"type": "message_end", "message": {
+            "role": "assistant", "content": [{"type": "text", "text": "Verdict: FAIL"}],
+        }})
+        self.finish(job)
+        self.assertEqual(self.selected("run.done")[0][1], ["melchior-fail-completions"])
 
     def test_unknown_or_nonstring_coordinator_is_rejected_before_job_admission(self):
         for coordinator_id in ("not-configured", 42, []):

@@ -27,6 +27,17 @@ _SUBSCRIBER_FIELDS = {"id", "url", "auth_header", "auth_value", "events", "lanes
 _HEADER = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _RESERVED = {"content-type", "x-omp-delivery", "x-omp-event", "host", "content-length", "transfer-encoding", "connection", "trailer", "upgrade", "expect", "proxy-authorization"}
+_MELCHIOR_COMPLETION_GATE = "melchior-fail-completions"
+_VERDICT = re.compile(r"(?im)^\s*Verdict:\s*(FAIL|PASS(?:\+NOTES)?)\b")
+_COMPLETED_FAIL = re.compile(
+    r"(?im)^\s*FAIL:|\bFAIL\s+[—–-]\s*P[0-3]\b|\bBLOCKED\b|READY\.md withheld")
+
+
+def _completed_fail(summary):
+    verdict = _VERDICT.search(summary)
+    if verdict is not None:
+        return verdict.group(1)[0] in "Ff"
+    return _COMPLETED_FAIL.search(summary) is not None
 
 
 class ConfigError(ValueError):
@@ -335,16 +346,6 @@ class WebhookDispatcher:
         with self._lock:
             if self._config_error:
                 raise _invalid()
-            # Explicit completion ownership is independent of broadcast filters.
-            # A union, rather than a second emit, prevents duplicate owner enqueues.
-            subscribers = [
-                s for s in self._config["subscribers"]
-                if bypass_filters
-                or (payload["event"] == "run.done" and s["id"] == coordinator_subscriber_id)
-                or ((not s.get("events") or payload["event"] in s["events"])
-                    and (not s.get("lanes") or payload.get("lane") in s["lanes"]
-                         or payload.get("lane_id") in s["lanes"]))
-            ]
             safe = dict(payload, version=1)
             summary = str(safe.get("summary", ""))
             # Redact before truncation; otherwise a credential can straddle char 300.
@@ -352,6 +353,19 @@ class WebhookDispatcher:
             for secret in sorted(secrets, key=len, reverse=True):
                 summary = summary.replace(secret, "[redacted]")
             safe["summary"] = summary[:300]
+            # Classify the exact delivered summary; do not infer an RPC outcome.
+            healthy_completion = payload["event"] == "run.done" and not _completed_fail(safe["summary"])
+            # Explicit ownership overrides broadcast filters. The MELCHIOR gate
+            # gets ordinary completed-fail matches, never unowned healthy work.
+            subscribers = [
+                s for s in self._config["subscribers"]
+                if bypass_filters
+                or (payload["event"] == "run.done" and s["id"] == coordinator_subscriber_id)
+                or ((not s.get("events") or payload["event"] in s["events"])
+                    and (not s.get("lanes") or payload.get("lane") in s["lanes"]
+                         or payload.get("lane_id") in s["lanes"])
+                    and not (healthy_completion and s["id"] == _MELCHIOR_COMPLETION_GATE))
+            ]
             return _Envelope(safe), subscribers
 
     def _submit(self, envelope, subscribers, batch=None):

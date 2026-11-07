@@ -95,10 +95,6 @@ class CoordinatorWakeTests(unittest.TestCase):
         approvals = [
             {"type": "extension_ui_request", "method": "confirm", "id": "approval",
              "title": "Approve task for this session"},
-            {"type": "extension_ui_request", "method": "confirm", "id": "omp-approval",
-             "title": "Approve this call"},
-            {"type": "extension_ui_request", "method": "confirm", "id": "numbered-approval",
-             "title": "Approve this call  2"},
             {"type": "extension_ui_request", "method": "confirm", "id": "eval-approval",
              "title": "Allow eval for this session"},
             {"type": "extension_ui_request", "method": "confirm", "id": "tool-approval",
@@ -131,13 +127,14 @@ class CoordinatorWakeTests(unittest.TestCase):
             ("confirm", "Approve production deployment?"),
             ("confirm", "Approve this callback change?"),
             ("ask", "Approve task for this session"),
+            ("confirm", "Approve this call  bash rm -rf /some/path"),
         ]):
             self.store.event(self.sid, {"type": "extension_ui_request", "method": method,
                                         "id": f"human-{index}", "title": title})
         decisions = self.selected("run.needs_input")
         self.assertEqual([payload["summary"] for payload, _ in decisions],
                          ["Approve production deployment?", "Approve this callback change?",
-                          "Approve task for this session"])
+                          "Approve task for this session", "Approve this call  bash rm -rf /some/path"])
         self.assertTrue(all(ids == ["melchior-lane-events"] for _, ids in decisions))
 
     def test_session_approval_with_external_effect_context_still_escalates(self):

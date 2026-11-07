@@ -479,6 +479,9 @@ class Store:
                     job["finalMessage"] = "\n".join(p.get("text", "") for p in message.get("content", []) if p.get("type") == "text")
                     changed = True
             elif kind == "prompt_result" and frame.get("id") == jid:
+                # A prompt can yield while native tasks still own pending result
+                # deliveries. OMP wakes this same parent session itself; retain
+                # the job/worktree until session_settled, without a relay prompt.
                 job["resultStatus"] = frame.get("status", "error")
                 job["resultError"] = frame.get("error")
                 if frame.get("sessionSettled"):

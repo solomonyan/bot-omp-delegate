@@ -22,11 +22,10 @@ def _is_routine_approval(request):
     if request.get("method") != "confirm" or not isinstance(request.get("title"), str):
         return False
     title = request["title"].strip()
-    # OMP rpc-ui tool approval title, plus session-scoped harness dialogs.
-    known = (_SESSION_APPROVAL.fullmatch(title)
-             or title.casefold() == "approve this call"
-             or title.casefold().startswith("approve this call  "))
-    return bool(known) and not _EXTERNAL_EFFECT.search(json.dumps(request, ensure_ascii=False))
+    # Match the existing receiver's session-scoped gate, not generic tool
+    # confirmations: a tool-call title alone does not establish routine work.
+    return bool(_SESSION_APPROVAL.fullmatch(title)) and not _EXTERNAL_EFFECT.search(
+        json.dumps(request, ensure_ascii=False))
 
 
 class Notifications:

@@ -11,7 +11,7 @@ omp-delegate answer JOB_ID --json '{"id":"UI_ID","confirmed":false}'
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","answers":[{"id":"QUESTION_ID","selectedOptions":["EXACT LABEL"]}]}'
 ```
 
-Routine `confirm` dialogs using session-scoped Approve/Allow task/eval wording or OMP's “Approve this call” title stay harness-local when their request context has no spend, production, merge, secret or other external-effect decision. Inspect/answer `pendingInput` through the existing control path; filtering never grants permission. Unknown confirmations, human questions and effect-bearing approval context still emit `run.needs_input` once per pending dialog ID.
+Routine `confirm` dialogs using the receiver gate's session-scoped Approve/Allow task/eval/tool wording stay harness-local when their request context has no spend, production, merge, secret or other external-effect decision. Inspect/answer `pendingInput` through the existing control path; filtering never grants permission. Unknown confirmations, generic “Approve this call” tool prompts, human questions and effect-bearing approval context still emit `run.needs_input` once per pending dialog ID.
 
 ## Session lifecycle
 
@@ -44,6 +44,8 @@ omp-delegate agent cancel JOB_ID AGENT_ID
 ```
 
 Cancellation is an OMP control request, not an OS-level hard kill. Descendant cleanup depends on OMP's supported behavior; detached tools, external side effects, and unrelated processes may continue. A stale parent job must not be redirected to a successor worker. Use job events and full session history only when the investigation requires them.
+
+Native `task` results wake their owning OMP parent session in-process. A `prompt_result` with `sessionSettled: false` is a yield, not final job completion: the delegate retains the same worker/job and worktree ownership through child-result delivery and resumed parent output, then settles on `session_settled`. Do not relay the result as another prompt or create a second parent session. Reopening with `--continue` is separate conversation persistence, not the result wake path.
 
 ## Outbound webhooks
 

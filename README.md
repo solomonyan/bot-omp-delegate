@@ -105,6 +105,12 @@ omp-delegate lane new LANE_ID
 
 Default close only closes an idle settled worker. Close preserves the conversation; `lane new` explicitly creates a fresh conversation after settlement and preserves old history. Use separate worktrees for parallel jobs.
 
+### Native parent continuation
+
+OMP delivers native `task` results into the same owning parent session and triggers its next turn in-process. The delegate keeps the worker, parent job and worktree ownership active when `prompt_result` has `sessionSettled: false`; it records the resumed parent's final message and finishes only after `session_settled`. Child completion alone is not a top-level completion webhook. No relay bot, second parent session or extra delegate prompt is involved.
+
+`--continue` preserves conversation identity when reopening an idle worker; it is not the child-result wake mechanism. Interrupted tasks are not silently restored or replayed. Regression coverage uses an offline RPC peer to exercise the delegate boundary; no paid model-backed child-completion run is claimed.
+
 The daemon can send best-effort HTTP notifications for lifecycle events. Notifications are delivered asynchronously; they do not block lane work. A full delivery queue drops notifications, and transient failures receive bounded retries. Delivery is not durable: daemon shutdown or a process failure can lose queued events, while retries can produce duplicate requests. Consumers should deduplicate by `X-OMP-Delivery`.
 
 ### Private configuration and provisioning

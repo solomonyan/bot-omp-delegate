@@ -144,10 +144,11 @@ class Worker:
 
     def _command(self):
         cmd = [os.environ.get("OMP_DELEGATE_OMP", "omp"), "--mode", "rpc-ui", "--cwd", self.cwd, "--session-dir", self.session_dir, "--continue", "--no-title"]
-        approval = self.options.get("approval_mode", "always-ask")
-        if approval not in ("yolo", "write", "always-ask-cached", "always-ask"):
-            raise ValueError("Invalid approval_mode")
-        cmd += ["--approval-mode", approval]
+        approval = self.options.get("approval_mode")
+        if approval is not None:
+            if approval not in ("yolo", "write", "always-ask-cached", "always-ask"):
+                raise ValueError("Invalid approval_mode")
+            cmd += ["--approval-mode", approval]
         for key, flag in (("model", "--model"), ("thinking", "--thinking"), ("profile", "--profile"), ("tools", "--tools")):
             if self.options.get(key) is not None:
                 cmd += [flag, str(self.options[key])]

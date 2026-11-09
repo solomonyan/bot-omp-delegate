@@ -138,17 +138,54 @@ class WebhookTests(unittest.TestCase):
         dispatcher.close()
 
     def test_event_and_lane_filters_match_name_or_id(self):
-        add_subscriber(self.root, self.subscriber(events=["run.done"], lanes=["coding"]))
-        add_subscriber(self.root, self.subscriber(id="by-id", events=["run.error"], lanes=["lane-42"]))
+        add_subscriber(self.root, self.subscriber(events=["run.stalled"], lanes=["coding"]))
+        add_subscriber(self.root, self.subscriber(id="by-id", events=["lane.idle"], lanes=["lane-42"]))
         dispatcher = WebhookDispatcher(self.root, retry_delays=())
         self.addCleanup(dispatcher.close)
-        dispatcher.emit({"event": "run.done", "lane": "other", "lane_id": "other"})
-        dispatcher.emit({"event": "run.error", "lane": "coding", "lane_id": "other"})
-        dispatcher.emit({"event": "run.done", "lane": "coding", "lane_id": "other"})
-        dispatcher.emit({"event": "run.error", "lane": "other", "lane_id": "lane-42"})
+        dispatcher.emit({"event": "run.stalled", "lane": "other", "lane_id": "other"})
+        dispatcher.emit({"event": "lane.idle", "lane": "coding", "lane_id": "other"})
+        dispatcher.emit({"event": "run.stalled", "lane": "coding", "lane_id": "other"})
+        dispatcher.emit({"event": "lane.idle", "lane": "other", "lane_id": "lane-42"})
         dispatcher._queue.join()
         self.assertCountEqual([(json.loads(body)["event"], json.loads(body)["lane_id"]) for body, _ in Receiver.received],
-                              [("run.done", "other"), ("run.error", "lane-42")])
+                              [("run.stalled", "other"), ("lane.idle", "lane-42")])
+
+    def test_mode_defaults_to_monitor_and_rejects_unknown_values(self):
+        add_subscriber(self.root, self.subscriber())
+        self.assertEqual(list_config(self.root)["subscribers"][0]["mode"], "monitor")
+        with self.assertRaises(ConfigError):
+            add_subscriber(self.root, self.subscriber(id="bad-mode", mode="chatty"))
+        add_subscriber(self.root, self.subscriber(id="conversational", mode="conversation"))
+        self.assertEqual([s["mode"] for s in list_config(self.root)["subscribers"]], ["monitor", "conversation"])
+
+    def test_conversational_events_reach_only_the_recorded_owner(self):
+        # The owner's own event filters exclude run.done; the second subscriber
+        # filter-matches run.done but is never the owner.
+        add_subscriber(self.root, self.subscriber(events=["run.deadline"]))
+        add_subscriber(self.root, self.subscriber(id="filter-match", events=["run.done"]))
+        dispatcher = WebhookDispatcher(self.root, retry_delays=())
+        self.addCleanup(dispatcher.close)
+        # Owner selection overrides the owner's filters; a filter-matching
+        # non-owner still receives nothing.
+        dispatcher.emit({"event": "run.done", "summary": "owned"}, coordinator_subscriber_id="test")
+        # Ownerless conversational events never broadcast.
+        dispatcher.emit({"event": "run.error", "summary": "ownerless"})
+        dispatcher._queue.join()
+        self.assertEqual(len(Receiver.received), 1)
+        self.assertEqual(json.loads(Receiver.received[0][0])["summary"], "owned")
+
+    def test_operational_events_use_filters_and_never_reach_conversation_subscribers(self):
+        add_subscriber(self.root, self.subscriber(events=["run.stalled"]))
+        add_subscriber(self.root, self.subscriber(id="conversational", mode="conversation"))
+        dispatcher = WebhookDispatcher(self.root, retry_delays=())
+        self.addCleanup(dispatcher.close)
+        dispatcher.emit({"event": "run.stalled", "lane": "coding"})
+        dispatcher.emit({"event": "lane.idle", "lane": "coding"})
+        # A mismatched channel must not broadcast a conversational event.
+        dispatcher.emit({"event": "run.done", "channel": "monitor", "lane": "coding"})
+        dispatcher._queue.join()
+        self.assertEqual([json.loads(body)["event"] for body, _ in Receiver.received],
+                         ["run.stalled"])
 
     def test_redaction_precedes_summary_truncation_and_git_uses_event_worktree(self):
         secret = "synthetic-authentication-secret-crossing-the-summary-boundary"
@@ -164,7 +201,7 @@ class WebhookTests(unittest.TestCase):
         expected_sha = git("rev-parse", "HEAD")
         dispatcher = WebhookDispatcher(self.root, retry_delays=())
         self.addCleanup(dispatcher.close)
-        dispatcher.emit({"event": "run.done", "cwd": str(project), "summary": "x" * 290 + secret, "label": "OPS-42"})
+        dispatcher.emit({"event": "run.done", "cwd": str(project), "summary": "x" * 290 + secret, "label": "OPS-42"}, coordinator_subscriber_id="test")
         dispatcher._queue.join()
         body, headers = Receiver.received[0]
         payload = json.loads(body)
@@ -172,6 +209,25 @@ class WebhookTests(unittest.TestCase):
         self.assertEqual((payload["version"], payload["branch"], payload["last_commit_sha"], payload["label"]),
                          (1, "event-check", expected_sha, "OPS-42"))
         self.assertEqual(headers["X-Token"], secret)
+
+    def test_nested_input_and_long_message_redacted_but_intact(self):
+        secret = "synthetic-credential-value-for-redaction"
+        add_subscriber(self.root, self.subscriber(auth_header="X-Token", auth_value=secret))
+        dispatcher = WebhookDispatcher(self.root, retry_delays=())
+        self.addCleanup(dispatcher.close)
+        dispatcher.emit({"event": "run.needs_input", "summary": "x" * 290 + secret,
+                         "message": "y" * 400 + secret,
+                         "input": {"input_id": "input-9",
+                                   "request": {"question": "Approve " + secret + "?",
+                                               "options": [secret, "ok"]}}},
+                        coordinator_subscriber_id="test")
+        dispatcher._queue.join()
+        payload = json.loads(Receiver.received[0][0])
+        self.assertEqual((payload["summary"], len(payload["summary"])), ("x" * 290 + "[redacted]", 300))
+        self.assertEqual(payload["message"], "y" * 400 + "[redacted]")
+        self.assertEqual(payload["input"]["input_id"], "input-9")
+        self.assertEqual(payload["input"]["request"]["question"], "Approve [redacted]?")
+        self.assertEqual(payload["input"]["request"]["options"], ["[redacted]", "ok"])
 
     def test_failed_receiver_retries_independently_of_healthy_subscriber(self):
         class Failing(Receiver):
@@ -280,14 +336,14 @@ class WebhookTests(unittest.TestCase):
             with patch("bot_omp_delegate.webhooks._request", side_effect=request):
                 dispatcher.emit({"event": "daemon.up"})
                 self.assertTrue(entered.wait(1))
-                dispatcher.emit({"event": "run.error"})
+                dispatcher.emit({"event": "run.stalled"})
                 timer = threading.Timer(.05, release.set)
                 timer.start()
                 before = time.monotonic()
                 dispatcher.close(drain_timeout=.5)
                 timer.join()
                 self.assertLess(time.monotonic() - before, 1.5)
-                self.assertEqual(delivered, ["daemon.up", "run.error"])
+                self.assertEqual(delivered, ["daemon.up", "run.stalled"])
         finally:
             release.set()
             dispatcher.close(drain_timeout=0)

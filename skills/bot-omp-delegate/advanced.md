@@ -1,17 +1,17 @@
 # Advanced lifecycle
 
-Load this reference only for session retention/configuration, lane assignment/removal, or subagent control. Routine work uses lane create/list/show/run/close/new and the returned job ID.
+Load this reference for webhook configuration/receivers, session retention/configuration, lane assignment/removal, or subagent control. Routine work uses lane create/list/show/run/close/new and the returned job ID.
 
 ## Questions and approvals
 
-For a pending UI request, the default approval tier is always-ask. The coordinator resolves the request and obtains owner approval when required; a waiter never chooses an answer or grants permission. Use the exact request ID and values/options from `pendingInput`:
+Workers inherit OMP's configured approval policy unless an explicit `approval_mode` is supplied; existing explicit modes retain their behavior. A waiter or coordinator never grants permission on the owner's behalf. Inspect the full pending request and use its exact request ID and values/options:
 
 ```sh
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","confirmed":false}'
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","answers":[{"id":"QUESTION_ID","selectedOptions":["EXACT LABEL"]}]}'
 ```
 
-Routine `confirm` dialogs using the receiver gate's session-scoped Approve/Allow task/eval/tool wording stay harness-local when their request context has no spend, production, merge, secret or other external-effect decision. Inspect/answer `pendingInput` through the existing control path; filtering never grants permission. Unknown confirmations, generic “Approve this call” tool prompts, human questions and effect-bearing approval context still emit `run.needs_input` once per pending dialog ID.
+Do not suppress unresolved approval dialogs. OMP permission policy remains authoritative.
 
 ## Session lifecycle
 
@@ -51,21 +51,17 @@ Native `task` results wake their owning OMP parent session in-process. A `prompt
 
 Load this reference when configuring notifications, diagnosing delivery, or implementing a receiver. Notifications are asynchronous best-effort signals; they never make a task durable or invoke a model. The bounded queue can drop events when full, shutdown can discard queued work, and retries can produce duplicates. Use job state as the source of truth and deduplicate deliveries.
 
-### Spawning-coordinator ownership
+### Conversational ownership and monitoring
 
-For a completion wake, pass `--coordinator-subscriber-id ID` with `lane run` or direct `turn`; HTTP dispatch uses `coordinator_subscriber_id`. The ID must already exist in private webhook configuration and is saved on the job, not inferred from a lane, label or global default. Use the spawning Grok coordinator's existing receiver path.
+Set subscriber `mode` to `conversation` or `monitor`; omitted mode defaults to `monitor` for observer compatibility. Use `conversation` for the Grok coordinator receiver, so it is excluded from operational notifications.
 
-When a job settles as `completed`, its owner is included once in the existing `run.done` enqueue, bypassing its generic event/lane filters. Generic non-MELCHIOR completion subscribers retain ordinary filtering. The `melchior-fail-completions` gate receives an ordinary match only for completed-fail summaries; healthy jobs select it only when it is their recorded owner. Thus ownerless healthy jobs and healthy jobs owned by another subscriber never fall back to MELCHIOR. Completed-fail jobs retain the ordinary gate match union their owner, without duplicates. Other terminal statuses remain `run.error`; non-completion filtering is unchanged.
+Pass `--coordinator-subscriber-id ID` with `lane run` or direct `turn`; HTTP dispatch uses `coordinator_subscriber_id`. The ID must exist in webhook configuration and is recorded on the job. Only this recorded owner receives `run.done`, `run.error`, and `run.needs_input`, with owner selection overriding its event/lane filters. A recorded owner may be either mode. Ownerless jobs have no conversational webhook and remain available through `read`/`wait`.
 
-Wake-once is sender-side enqueue idempotency, not durable exactly-once delivery. A Grok coordinator should deduplicate `X-OMP-Delivery` retries and ignore a repeated `{job_id}:run.done` business key before supervising or starting its next unit. No relay bot or new receiver service is required. Source updates need a later operator-controlled daemon restart; config reload alone cannot activate code.
+Operational events (`run.deadline`, `run.stalled`, `lane.idle`, `daemon.up`) use the configured event/lane filters and are delivered only to monitor subscribers. Notifications do not invoke Grok or change task/permission policy.
 
-For MELCHIOR's existing deployment, record `melchior-fail-completions` as owner when MELCHIOR spawned the job. The sender selects that gate for healthy completions only with this recorded ownership, or for ordinary completed-fail matches regardless of ownership. The unchanged `coordinator-2026-11-07` receiver forwards selected completions to `melchior-lane-events` and the Grok wellness-ops lane-events routine. It claims each `job_id` under a file lock before POST, drops duplicate finishes, and does not automatically retry an ambiguous failed forward. Error/deadline/stalled/human-decision routes remain unchanged. No production receiver, ledger or webhook configuration is changed.
+Grok submits once with the coordinator ID, handles `run.needs_input` through the existing `answer` path, receives the final full response, and continues in the same session. Use a detached job plus webhook as the conversational path; use `read`/`wait` for inspection and recovery rather than a second foreground wake path. Do not wake Grok for progress or operational events.
 
-Completed-fail uses the exact payload summary after existing redaction and truncation to 300 characters; no new outcome field is added:
-
-1. The first match of `(?im)^\s*Verdict:\s*(FAIL|PASS(?:\+NOTES)?)\b` wins. `FAIL` is completed-fail; `PASS` or `PASS+NOTES` is healthy and overrides fallback markers anywhere else.
-2. Without a matching Verdict line, completed-fail requires one of these case-insensitive expressions: `(?im)^\s*FAIL:`, `\bFAIL\s+[—–-]\s*P[0-3]\b`, `\bBLOCKED\b`, or `READY\.md withheld`.
-3. Missing, empty and all other summaries are healthy. “Fail” or “failed” in ordinary prose does not suffice.
+Version 1 notifications include `channel` (`conversation` or `monitor`), `session_id`, `job_id`, and stable business `event_id`. Terminal events include the full `message`; input events include `input_id` and the full input request. `summary` remains a bounded diagnostic preview, not a substitute for message/input content. Endpoint, auth, and HMAC configured values are recursively redacted from user-visible string values. Receivers deduplicate by `event_id` before invoking Grok. `X-OMP-Delivery` is stable across retries; retries can duplicate HTTP requests and there is no exactly-once guarantee.
 
 ### Private configuration
 
@@ -86,14 +82,15 @@ The schema is:
       "auth_value": "<private value>",
       "hmac_secret": "<private signing secret>",
       "signature_header": "X-OMP-Signature",
-      "events": ["run.done", "run.error"],
-      "lanes": ["production"]
+      "events": ["run.stalled", "run.deadline"],
+      "lanes": ["production"],
+      "mode": "monitor"
     }
   ]
 }
 ```
 
-`id` is a required non-secret identifier. `url` must use HTTP(S); plain HTTP is accepted only for loopback. `auth_header`, `auth_value`, `hmac_secret`, `signature_header`, `events`, and `lanes` are optional. Signature header defaults to `X-OMP-Signature`. Events restrict delivery to listed event names. Lane entries match either lane names or lane IDs. Omitted filters match all applicable events/lanes. Subscriber IDs cannot be added twice; remove an entry before adding a replacement.
+`id` is a required non-secret identifier. `url` must use HTTP(S); plain HTTP is accepted only for loopback. `auth_header`, `auth_value`, `hmac_secret`, `signature_header`, `events`, `lanes`, and `mode` are optional. `mode` accepts `conversation` or `monitor` and defaults to `monitor`. Signature header defaults to `X-OMP-Signature`. Events restrict operational notifications to listed event names; lane entries match either lane names or lane IDs. Operational notifications only reach monitor subscribers; conversational events route only to the recorded job owner, regardless of that owner's filters.
 
 Provision via one JSON object on stdin; put no URL, header value, or signing secret in command arguments or echoed interactive input:
 
@@ -121,18 +118,21 @@ Supported event names:
 | `daemon.up` | Daemon started serving. |
 | `run.done` | A job completed. |
 | `run.error` | A job errored, was aborted, or was interrupted. |
-| `run.needs_input` | A newly pending human-decision dialog needs an answer; routine harness approvals are excluded. Emitted once per pending dialog ID. |
+| `run.needs_input` | A newly pending input request; emitted once per pending dialog ID. It is delivered only to the recorded coordinator owner. |
 | `run.stalled` | A running job produced no output for the configured threshold; skipped while waiting for input and suppressed until new output resumes. |
 | `run.deadline` | A CLI waiter reached its deadline; the underlying job may continue and is not cancelled by this event. |
 | `lane.idle` | Optional notification for an idle episode. |
 
-A stall is an inactivity signal, not proof of deadlock or task failure. Polling, response acknowledgements, state reads, and heartbeat-only frames do not count as output resumption. A deadline is about the waiter, not task termination. Unassigned sessions and daemon-level events use empty lane fields. Notifications have no automatic model calls or task-policy effects.
+`run.done` and `run.error` also route only to the recorded coordinator owner. Ownerless jobs remain available through job read/wait APIs without conversational notifications. Operational events (`run.stalled`, `run.deadline`, `lane.idle`, `daemon.up`) use event/lane filters and only go to monitor subscribers. A stall is an inactivity signal, not proof of deadlock or task failure. A deadline is about the waiter, not task termination. Notifications have no automatic model calls or task-policy effects.
 
-Lifecycle event payloads use version 1 and include `event`, `lane`, `lane_id`, `job_id`, `status`, `cwd`, `branch`, `last_commit_sha`, `summary`, and offset-aware ISO timestamp `ts`; `label` is optional. Summaries are bounded to 300 characters. Git metadata is resolved by delivery workers, not lane threads, and may be empty when unavailable. Test payloads use safe generic content and empty lane/job/path/git fields.
+Version 1 payloads include `channel`, `session_id`, `event_id`, `event`, `lane`, `lane_id`, `job_id`, `status`, `cwd`, `branch`, `last_commit_sha`, `summary`, and offset-aware ISO timestamp `ts`; `label` is optional. Terminal conversational events include full `message`; `run.needs_input` includes `input_id` and full input request. Summary is bounded to 300 characters and is only a diagnostic preview. Git metadata is resolved by delivery workers and may be empty when unavailable. Configured endpoint/auth/HMAC values are recursively redacted from user-visible string values, not structural keys or identifiers.
 
 ```json
 {
   "version": 1,
+  "channel": "conversation",
+  "session_id": "session-id",
+  "event_id": "stable-business-event-id",
   "event": "run.done",
   "lane": "coding",
   "lane_id": "lane-id",
@@ -141,17 +141,18 @@ Lifecycle event payloads use version 1 and include `event`, `lane`, `lane_id`, `
   "cwd": "/path/to/worktree",
   "branch": "feature/ticket",
   "last_commit_sha": "commit-sha",
-  "summary": "Implemented the requested change",
+  "summary": "Bounded diagnostic preview",
+  "message": "Full final response",
   "ts": "2026-10-31T12:00:00+00:00",
   "label": "OPS-42"
 }
 ```
 
-Git fields describe the repository when the delivery worker observes it, not an atomic completion-time snapshot. Inactivity timers use monotonic time and restart with the daemon; they do not retrospectively alert for downtime. Idle alerts exclude archived sessions and active lifecycle transitions. Configured endpoint/auth/signing values are redacted from summaries before truncation, but arbitrary project secrets are not automatically detected: paths, labels and summaries must only go to trusted receivers.
+Git fields describe the repository when the delivery worker observes it, not an atomic completion-time snapshot. Inactivity timers use monotonic time and restart with the daemon; they do not retrospectively alert for downtime. Idle alerts exclude archived sessions and active lifecycle transitions. Configured endpoint/auth/signing values are recursively redacted from user-visible payload string values, but arbitrary project secrets are not automatically detected: paths, labels and summaries must only go to trusted receivers.
 
 ### Delivery and receiver verification
 
-Each HTTP request is JSON (`Content-Type: application/json`) and carries `X-OMP-Delivery`, a UUID stable across retries, and `X-OMP-Event`. Configured authentication is sent using the named header/value. With an HMAC secret, the configured signature header contains `sha256=<hex>` where the digest is HMAC-SHA256 over the exact raw HTTP body bytes. Verify the signature against raw bytes before JSON parsing; compare digests in constant time and deduplicate by `X-OMP-Delivery`.
+Each HTTP request is JSON (`Content-Type: application/json`) and carries `X-OMP-Delivery`, a UUID stable across retries, and `X-OMP-Event`. Configured authentication is sent using the named header/value. With an HMAC secret, the configured signature header contains `sha256=<hex>` where the digest is HMAC-SHA256 over the exact raw HTTP body bytes. Verify the signature against raw bytes before JSON parsing; compare digests in constant time and deduplicate conversational turns by `event_id` before invoking Grok.
 
 Only 2xx responses count as successful. Network failures and non-2xx statuses receive three retries after the initial attempt, using backoff of 1, 2 and 4 seconds. Each attempt has a five-second socket deadline, including trickled response headers; system DNS resolution remains governed by the OS resolver. Requests do not follow redirects or use environment proxies. Up to four workers and a 256-entry queue bound delivery work. Subscribers are queued independently, but shared-worker saturation can delay other receivers. Graceful shutdown gives queued events a one-second drain opportunity, then stops retries with a bounded worker join. Queue saturation, a slow receiver or shutdown can lose events. Retries can duplicate deliveries; there is no durable queue or replay.
 

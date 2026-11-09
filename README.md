@@ -6,49 +6,15 @@ Generic integration: each operator uses their own OMP installation, login, confi
 
 ## Outbound webhook notifications
 
-The daemon can send best-effort HTTP notifications for lifecycle events. Notifications are delivered asynchronously; they do not block lane work. A full delivery queue drops notifications, and transient failures receive bounded retries. Delivery is not durable: daemon shutdown or a process failure can lose queued events, while retries can produce duplicate requests. Consumers should deduplicate by `X-OMP-Delivery`.
+Webhooks are best-effort asynchronous notifications, not a durable queue. Configure subscribers in the private `webhooks.json` under the delegate state directory; protect endpoint/auth/HMAC values and send only to trusted receivers. `events` and `lanes` filter operational notifications. Subscriber `mode` is `conversation` or `monitor` and defaults to `monitor` for existing observer compatibility.
 
-### Private configuration and provisioning
+Conversational events (`run.done`, `run.error`, `run.needs_input`) go only to the job's recorded `coordinator_subscriber_id`; owner selection overrides that subscriber's event/lane filters. Ownerless jobs remain available through `read`/`wait` and produce no conversational webhook. Set the coordinator subscriber to `mode: "conversation"` to keep operational events from waking Grok. Operational events (`run.deadline`, `run.stalled`, `lane.idle`, `daemon.up`) use normal event/lane filters and are delivered only to `monitor` subscribers. Notifications do not invoke a model or change OMP permissions.
 
-Webhook configuration is stored in `webhooks.json` under the delegate state directory (by default `~/.omp-delegate`, or the directory selected by `--state-dir`). Keep the state directory private. The configuration file is owner-owned, regular, and mode `0600`; the daemon rejects symlinks and insecure permissions. Timer settings (`stall_seconds` and nullable `idle_seconds`) are configured directly in this private JSON file. The `webhook list` command reveals safe subscriber metadata only; it redacts URLs and never displays authentication or signing values.
+Version 1 payloads include `channel` (`conversation` or `monitor`), `session_id`, `job_id`, and stable business `event_id`; terminal responses carry the full `message`, and questions carry `input_id` plus the full input request. The bounded `summary` is a diagnostic preview, not the response. Configured endpoint/auth/HMAC values are recursively redacted from user-visible string values, not structural keys or identifiers. `X-OMP-Delivery` remains stable across HTTP retries. Receivers should deduplicate by `event_id` before invoking Grok; HTTP delivery is best-effort and is not exactly-once. Verify configured HMAC signatures against raw request bytes before parsing.
 
-Provision one subscriber at a time by piping one JSON object to standard input. Keep the URL and secret values out of shell arguments, command history, and interactive echoed input:
+Grok submits once with its coordinator subscriber ID, receives questions and answers them through the existing `answer` path, then receives the full final response. Continue follow-up work in the same session. Use a detached job plus webhook as the primary conversational path; `read`/`wait` are for inspection and recovery. Do not keep a foreground waiter and webhook both waking Grok, and do not wake the model for progress or operational events.
 
-```sh
-printf '%s\n' '{"id":"ops","url":"https://receiver.example/events","auth_header":"Authorization","auth_value":"<private value>","hmac_secret":"<private signing secret>"}' |
-  omp-delegate webhook add
-omp-delegate webhook list
-omp-delegate webhook test
-omp-delegate webhook remove ops
-```
-
-Replace the illustrative endpoint and placeholders locally; do not put real credentials in scripts or documentation. Subscribers require an ID and an HTTP(S) URL. HTTP is permitted only for loopback receivers. Optional fields include `auth_header`, `auth_value`, `hmac_secret`, `signature_header`, `events`, and `lanes`. The default signature header is `X-OMP-Signature`. `webhook add --id ID` sets or overrides the non-secret subscriber ID. Duplicate IDs are rejected rather than silently replaced.
-
-Changes are saved locally first. The CLI then attempts a runtime reload; if the daemon is unavailable or does not support the reload route, the saved configuration remains in place and takes effect when the daemon next starts. `webhook test [--event daemon.up]` sends an explicit connectivity test that bypasses subscriber filters and reports sanitized delivery receipts; it exits successfully when there are no subscribers or all attempted deliveries succeed.
-
-### Events, filters and delivery
-
-Events describe lifecycle facts: `daemon.up`, `run.done`, `run.error`, `run.needs_input`, `run.stalled`, `run.deadline`, and optional `lane.idle`. A waiter deadline means the waiter stopped waiting; it does not mean the task was cancelled. Stall means no new output for the configured interval, not proof of deadlock. Notifications do not invoke a model or alter task policy.
-
-An `events` filter selects event names; a `lanes` filter selects lane names or lane IDs. Omitted filters receive all applicable events. Lane and job fields are empty for daemon-level events and unassigned sessions. `run.needs_input` is emitted once for a newly pending human decision; recognized routine tool/session approvals stay pending in the harness without a webhook or automatic answer. Stall alerts are suppressed until output resumes, then may fire again. Deadline alerts do not cancel work.
-
-Requests are JSON with an `X-OMP-Event` header and stable `X-OMP-Delivery` identifier across retries. When `hmac_secret` is configured, the signature header carries `sha256=` followed by the hexadecimal HMAC-SHA256 of the exact request body bytes. Receivers should verify the signature against the raw body before parsing JSON and deduplicate retries using the delivery identifier. Authentication headers are optional and configured per subscriber.
-
-The daemon retries transient network failures and non-2xx responses with bounded backoff. It avoids redirects and environment-configured proxies; response bodies and credential-bearing values are not exposed in CLI receipts. Notifications are an operational convenience, not a durable event log or a replacement for querying job state.
-
-For the complete event payload, configuration schema, and operational limits, see [`skills/bot-omp-delegate/advanced.md`](skills/bot-omp-delegate/advanced.md).
-
-### Spawning-coordinator completion wake
-
-Pass `--coordinator-subscriber-id ID` to `lane run` or `turn` to record an existing, non-secret webhook subscriber ID on that job (`coordinator_subscriber_id` in HTTP requests). On completion, that owner receives the existing `run.done` payload even if its generic event/lane filters exclude it. Selection is a union without duplicate owner enqueues. Generic non-MELCHIOR completion subscribers keep ordinary filtering, but `melchior-fail-completions` receives an ordinary match only for completed-fail summaries. Errors, deadlines, stalls and human decisions keep their existing routes.
-
-“Wake once” means one completion enqueue per settled job, not exactly-once HTTP delivery. Deduplicate retries by `X-OMP-Delivery` and treat `{job_id}:run.done` as the completion business key before starting the next unit. Delivery remains best-effort; no receiver service or model invocation is added here.
-
-For the existing MELCHIOR installation, record `melchior-fail-completions` as the owner only when MELCHIOR spawned the job. Healthy ownerless jobs and healthy jobs owned by another subscriber do not select that gate. Completed-fail jobs retain its ordinary completion-gate route, union their recorded owner if any. Its unchanged `coordinator-2026-11-07` receiver forwards selected completions to `melchior-lane-events` → Grok's wellness-ops lane-events routine; it claims `job_id` under `flock` before forwarding, so duplicate finishes and ambiguous failed attempts are not resent. This is at-most-once forwarding, not guaranteed delivery. No live receiver, ledger or configuration is changed.
-
-Completed-fail classification uses the delivered summary after redaction and truncation to 300 characters, not a new job/RPC outcome field. The first line matching `(?im)^\s*Verdict:\s*(FAIL|PASS(?:\+NOTES)?)\b` wins: `FAIL` is completed-fail; `PASS` and `PASS+NOTES` are healthy, even if other failure markers appear. Without a matching Verdict line, only a line-leading `FAIL:`, `FAIL` followed by an em/en/hyphen dash and `P0`–`P3`, the word `BLOCKED`, or `READY.md withheld` marks completed-fail (case-insensitive). Missing/empty summaries and other text, including prose mentioning “fail” or “failed”, are healthy. Exact fallback expressions are in the [advanced reference](skills/bot-omp-delegate/advanced.md#spawning-coordinator-ownership).
-
-These source changes require a later, operator-controlled daemon restart to affect an already-running process; webhook configuration reload alone does not load Python code. Do not restart a live daemon with in-flight work.
+The daemon's delivery queue is bounded; shutdown or queue saturation can lose notifications, and receivers should use job state for recovery. For configuration schema, event semantics, and delivery limits, see [`skills/bot-omp-delegate/advanced.md`](skills/bot-omp-delegate/advanced.md).
 
 Generic integration: each operator uses their own OMP installation, login, configuration and project files. Provider credentials are not bundled with the project.
 
@@ -56,7 +22,7 @@ Generic integration: each operator uses their own OMP installation, login, confi
 
 - macOS or Linux; Python 3.11+; installed, authenticated `omp` on PATH.
 - No Python packages or JavaScript dependencies to install.
-- Tested against OMP 18.14.1. Requires RPC v2 negotiation, `prompt_result`, `session_settled`, and `abort_and_restore_queue`.
+- Requires RPC v2 negotiation, `prompt_result`, `session_settled`, and `abort_and_restore_queue`. Conversation/approval smoke verified with installed OMP 18.18.2 and a local deterministic model; earlier model-backed verification used 18.14.1.
 
 ```sh
 git clone https://github.com/solomonyan/bot-omp-delegate.git
@@ -80,7 +46,7 @@ flowchart LR
     D[Global OMP setup] --> C
     E[Target project config and instructions] --> C
     C -->|Questions and settled result| B
-    B -->|CLI waiter report| A
+    B -->|Owner-routed webhook| A
 ```
 
 ## Routine lane workflow
@@ -113,37 +79,6 @@ OMP delivers native `task` results into the same owning parent session and trigg
 
 `--continue` preserves conversation identity when reopening an idle worker; it is not the child-result wake mechanism. Interrupted tasks are not silently restored or replayed. Regression coverage uses an offline RPC peer to exercise the delegate boundary; no paid model-backed child-completion run is claimed.
 
-The daemon can send best-effort HTTP notifications for lifecycle events. Notifications are delivered asynchronously; they do not block lane work. A full delivery queue drops notifications, and transient failures receive bounded retries. Delivery is not durable: daemon shutdown or a process failure can lose queued events, while retries can produce duplicate requests. Consumers should deduplicate by `X-OMP-Delivery`.
-
-### Private configuration and provisioning
-
-Webhook configuration is stored in `webhooks.json` under the delegate state directory (by default `~/.omp-delegate`, or the directory selected by `--state-dir`). Keep the state directory private. The configuration file is owner-owned, regular, and mode `0600`; the daemon rejects symlinks and insecure permissions. Timer settings (`stall_seconds` and nullable `idle_seconds`) are configured directly in this private JSON file. The `webhook list` command reveals safe subscriber metadata only; it redacts URLs and never displays authentication or signing values.
-
-Provision one subscriber at a time by piping one JSON object to standard input. Keep the URL and secret values out of shell arguments, command history, and interactive echoed input:
-
-```sh
-printf '%s\n' '{"id":"ops","url":"https://receiver.example/events","auth_header":"Authorization","auth_value":"<private value>","hmac_secret":"<private signing secret>"}' |
-  omp-delegate webhook add
-omp-delegate webhook list
-omp-delegate webhook test
-omp-delegate webhook remove ops
-```
-
-Replace the illustrative endpoint and placeholders locally; do not put real credentials in scripts or documentation. Subscribers require an ID and an HTTP(S) URL. HTTP is permitted only for loopback receivers. Optional fields include `auth_header`, `auth_value`, `hmac_secret`, `signature_header`, `events`, and `lanes`. The default signature header is `X-OMP-Signature`. `webhook add --id ID` sets or overrides the non-secret subscriber ID. Duplicate IDs are rejected rather than silently replaced.
-
-Changes are saved locally first. The CLI then attempts a runtime reload; if the daemon is unavailable or does not support the reload route, the saved configuration remains in place and takes effect when the daemon next starts. `webhook test [--event daemon.up]` sends an explicit connectivity test that bypasses subscriber filters and reports sanitized delivery receipts; it exits successfully when there are no subscribers or all attempted deliveries succeed.
-
-### Events, filters and delivery
-
-Events describe lifecycle facts: `daemon.up`, `run.done`, `run.error`, `run.needs_input`, `run.stalled`, `run.deadline`, and optional `lane.idle`. A waiter deadline means the waiter stopped waiting; it does not mean the task was cancelled. Stall means no new output for the configured interval, not proof of deadlock. Notifications do not invoke a model or alter task policy.
-
-An `events` filter selects event names; a `lanes` filter selects lane names or lane IDs. Omitted filters receive all applicable events. Lane and job fields are empty for daemon-level events and unassigned sessions. `run.needs_input` is emitted once for a newly pending human decision; recognized routine tool/session approvals stay pending in the harness without a webhook or automatic answer. Stall alerts are suppressed until output resumes, then may fire again. Deadline alerts do not cancel work.
-
-Requests are JSON with an `X-OMP-Event` header and stable `X-OMP-Delivery` identifier across retries. When `hmac_secret` is configured, the signature header carries `sha256=` followed by the hexadecimal HMAC-SHA256 of the exact request body bytes. Receivers should verify the signature against the raw body before parsing JSON and deduplicate retries using the delivery identifier. Authentication headers are optional and configured per subscriber.
-
-The daemon retries transient network failures and non-2xx responses with bounded backoff. It avoids redirects and environment-configured proxies; response bodies and credential-bearing values are not exposed in CLI receipts. Notifications are an operational convenience, not a durable event log or a replacement for querying job state.
-
-For the complete event payload, configuration schema, and operational limits, see [`skills/bot-omp-delegate/advanced.md`](skills/bot-omp-delegate/advanced.md).
 
 Existing commands remain available: `session create/list/compact`, `turn SESSION MESSAGE`, `wait/read/events/steer/interrupt/answer JOB`. `turn` remains direct session dispatch; lanes are the routine interface.
 
@@ -183,30 +118,23 @@ Environment variables:
 
 ## Approvals and questions
 
-The default is `--approval-mode always-ask`, overriding a more permissive inherited approval tier. This is approval mediation, **not an OS sandbox**. OMP can access what its OS user can access when permitted; skills/extensions run with that user's permissions too. Do not expose this endpoint to untrusted coordinators or run untrusted extensions.
+Workers inherit OMP's configured approval policy unless `approval_mode` is explicitly supplied. Existing explicit modes, including `write` and `yolo`, retain their meaning. Approval mediation is not an OS sandbox: OMP and its tools remain subject to the OS user's access. Never suppress an unresolved approval or grant permission on the coordinator's behalf.
 
-A waiting job reports `status: waiting_input` and `pendingInput`; foreground waiters print new questions to stderr. The coordinator answers from a separate CLI process:
+A job with a pending request reports `status: waiting_input` and `pendingInput`. Conversational webhook delivery includes the full question request and `input_id`; Grok answers through the existing control path only after resolving the request under the owner's policy:
 
 ```sh
-# Tool approvals are select dialogs: use an exact option from pendingInput.
-omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","value":"Approve"}'
-# Explicitly decline a confirm dialog:
 omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","confirmed":false}'
-# Answer a structured ask dialog using the exact question IDs and option labels:
-omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","answers":[{"id":"db","selectedOptions":["SQLite"]}]}'
-# Other OMP dialog forms accept value or cancelled, as appropriate:
-omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","cancelled":true}'
+omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","answers":[{"id":"QUESTION_ID","selectedOptions":["EXACT OPTION"]}]}'
 ```
 
-There is no auto-answer or auto-approval in the delegate. OMP's own dialog timeout behavior still applies; in particular an `ask` timeout can choose recommended/first options. The coordinator resolves questions or obtains owner approval before answering. See the pending request timeout. To permit unattended changes, the owner can explicitly select `session create --approval-mode write` or `yolo`; those are broader authority, not sandbox modes. A waiter escalates input needs and makes no approval/product decisions.
+Use the exact request ID and values/options from `pendingInput`. OMP's own dialog timeout behavior still applies; for example, an `ask` timeout can select recommended/first options.
 
 ## Grok Bot workflow
 
-Load [`skills/bot-omp-delegate/SKILL.md`](skills/bot-omp-delegate/SKILL.md) into Grok Bot's skills. Give Grok the installed absolute `omp-delegate` path and target project path.
+Load [`skills/bot-omp-delegate/SKILL.md`](skills/bot-omp-delegate/SKILL.md) into Grok Bot's skills. Give Grok the installed absolute `omp-delegate` path and target project path. For conversational webhooks, configure its subscriber with `mode: "conversation"` and pass that ID as `--coordinator-subscriber-id` when submitting a detached job. Submit once; Grok handles a question via `answer`, receives the full final response, and continues in the same session. Use `read`/`wait` to inspect or recover a job, not as a second foreground conversational wake path.
 
-One low-effort waiter subagent runs the blocking `lane run` command in a foreground Shell call. If the platform returns a still-running shell handle, the waiter uses consecutive foreground waits on **that same handle**, not another turn submission. The main bot remains free and gets a single completion report. If a question appears, the waiter escalates it while preserving the active foreground wait.
+The Grok Mac app does not imply local shell access. Run the delegate in an executor that can reach the local daemon, OMP installation, and worktree.
 
-The Grok Mac app does not imply local shell access. Run the waiter in an executor that has this CLI and can reach the local daemon, OMP installation, and worktree.
 
 ## Lifecycle and safety
 
@@ -226,41 +154,6 @@ The `.gitignore` excludes common local environment files, credential/key files, 
 
 Provider credentials stay with each operator's OMP installation. That is not a guarantee that runtime output is secret-free: prompts, tool output and extensions can expose sensitive data if permitted. Review any transcript or diagnostic attachment before sharing it.
 
-## Outbound webhook notifications
-
-The daemon can send best-effort HTTP notifications for lifecycle events. Notifications are delivered asynchronously; they do not block lane work. A full delivery queue drops notifications, and transient failures receive bounded retries. Delivery is not durable: daemon shutdown or a process failure can lose queued events, while retries can produce duplicate requests. Consumers should deduplicate by `X-OMP-Delivery`.
-
-### Private configuration and provisioning
-
-Webhook configuration is stored in `webhooks.json` under the delegate state directory (by default `~/.omp-delegate`, or the directory selected by `--state-dir`). Keep the state directory private. The configuration file is owner-owned, regular, and mode `0600`; the daemon rejects symlinks and insecure permissions. Timer settings (`stall_seconds` and nullable `idle_seconds`) are configured directly in this private JSON file. The `webhook list` command reveals safe subscriber metadata only; it redacts URLs and never displays authentication or signing values.
-
-Provision one subscriber at a time from a private JSON file or a secret-manager pipe. Keep endpoint and secret values out of shell arguments, command history, and interactive echoed input:
-
-```sh
-# Create this subscriber object with your secret manager/editor, mode 0600.
-omp-delegate webhook add < /private/path/subscriber.json
-omp-delegate webhook list
-omp-delegate webhook test
-omp-delegate webhook remove ops
-```
-
-Replace the illustrative endpoint and placeholders locally; do not put real credentials in scripts or documentation. Subscribers require an ID and an HTTP(S) URL. HTTP is permitted only for loopback receivers. Optional fields include `auth_header`, `auth_value`, `hmac_secret`, `signature_header`, `events`, and `lanes`. The default signature header is `X-OMP-Signature`. `webhook add --id ID` sets or overrides the non-secret subscriber ID. Duplicate IDs are rejected rather than silently replaced.
-
-Changes are saved locally first. The CLI then attempts a runtime reload; if the daemon is unavailable or does not support the reload route, the saved configuration remains in place and takes effect when the daemon next starts. `webhook test [--event daemon.up]` sends an explicit connectivity test that bypasses subscriber filters and reports sanitized delivery receipts; it exits successfully when there are no subscribers or all attempted deliveries succeed.
-
-Timer edits in `webhooks.json` apply after a reload or restart. Use `omp-delegate daemon restart --idle-only` once all work is settled; it atomically rejects a busy daemon and prevents new dispatch during shutdown. Older daemons without this capability require the coordinator to stop submitting work before their initial upgrade.
-
-### Events, filters and delivery
-
-Events describe lifecycle facts: `daemon.up`, `run.done`, `run.error`, `run.needs_input`, `run.stalled`, `run.deadline`, and optional `lane.idle`. A waiter deadline means the waiter stopped waiting; it does not mean the task was cancelled. Stall means no new output for the configured interval, not proof of deadlock. Notifications do not invoke a model or alter task policy.
-
-An `events` filter selects event names; a `lanes` filter selects lane names or lane IDs. Omitted or empty filters receive all applicable events. Lane fields are empty for unassigned sessions; daemon events also have empty job fields. `run.needs_input` is emitted once per pending dialog ID. `run.stalled` defaults to 30 minutes without observed output, is suppressed during questions/approvals, and rearms when output resumes. `lane.idle` is disabled by default. Deadline alerts are once per live job and do not cancel work. Add optional coordination metadata with `lane run ... --label OPS-42`.
-
-Requests are JSON with an `X-OMP-Event` header and stable `X-OMP-Delivery` identifier across retries. When `hmac_secret` is configured, the signature header carries `sha256=` followed by the hexadecimal HMAC-SHA256 of the exact request body bytes. Receivers should verify the signature against the raw body before parsing JSON and deduplicate retries using the delivery identifier. Authentication headers are optional and configured per subscriber.
-
-Each delivery receives an initial attempt plus three retries, after 1, 2 and 4 seconds. Up to four workers use bounded request timeouts and a 256-entry queue; failures never block or kill a lane. Requests do not follow redirects or use environment-configured proxies. CLI receipts omit response bodies, endpoints and credentials. Payloads include project paths, Git metadata and a short output/error summary: configure only trusted receivers. This is not a general-purpose secret scanner or a durable event log; job state remains authoritative.
-
-For the complete event payload, configuration schema, and operational limits, see [`skills/bot-omp-delegate/advanced.md`](skills/bot-omp-delegate/advanced.md).
 
 ## Development
 

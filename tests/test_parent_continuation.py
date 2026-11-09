@@ -143,20 +143,20 @@ class ParentContinuationTests(unittest.TestCase):
         self.assertEqual([event["event"] for event in self.sink.events], ["run.done"])
         self.assertEqual(self.prompt_count(), 1)
 
-    def test_local_approval_answer_allows_same_parent_to_continue(self):
+    def test_caller_approval_answer_allows_same_parent_to_continue(self):
         job, worker = self.begin("approval")
         self.wait_for(lambda: bool(job["pendingInput"]))
         self.assertEqual(job["status"], "waiting_input")
-        self.assertEqual(job["pendingInput"][0]["title"], "Approve task for this session")
-        self.assertEqual(self.sink.events, [])
-        # An explicit harness answer, not an automatic approval by the filter.
+        self.assertEqual(self.sink.events[0]["input_id"], "ui-1")
+        self.assertEqual([event["event"] for event in self.sink.events], ["run.needs_input"])
+        # A real pending approval requires an explicit caller answer.
         self.store.control(job["id"], "answer", {"id": "ui-1", "confirmed": True})
         self.wait_for(lambda: job["status"] in TERMINAL)
         self.assertEqual(job["pendingInput"], [])
         self.assertEqual((job["status"], job["finalMessage"]), ("completed", RESUMED_TEXT))
         self.assertIs(self.store.workers[self.sid], worker)
         self.assertEqual(self.prompt_count(), 1)
-        self.assertEqual([event["event"] for event in self.sink.events], ["run.done"])
+        self.assertEqual([event["event"] for event in self.sink.events], ["run.needs_input", "run.done"])
 
     def test_yielded_error_remains_error_after_background_work_drains(self):
         job, worker = self.begin("prompt-error")

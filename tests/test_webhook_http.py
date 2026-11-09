@@ -95,10 +95,14 @@ class WebhookHttpTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         port = server.server_port
-        self.cli(state, port, "webhook", "add", input=json.dumps({"id": "coordinator", "url": self.url}))
+        self.cli(state, port, "webhook", "add", input=json.dumps(
+            {"id": "coordinator", "url": self.url, "mode": "conversation"}))
+        self.cli(state, port, "webhook", "add", input=json.dumps(
+            {"id": "diagnostics", "url": self.url, "mode": "monitor", "events": ["run.deadline"]}))
         lane = self.cli(state, port, "lane", "create", "--name", "coding", "--cwd", str(self.project))
         with patch.object(store, "_run"):
-            job = self.cli(state, port, "lane", "run", lane["id"], "work", "--label", "OPS-42", "--detach")
+            job = self.cli(state, port, "lane", "run", lane["id"], "work", "--label", "OPS-42",
+                           "--coordinator-subscriber-id", "coordinator", "--detach")
         self.cli(state, port, "wait", job["id"], "--max-hours", "0.000001", expected=3)
         deadline = self.received.get(timeout=3)
         self.assertEqual((deadline["event"], deadline["job_id"], deadline["label"]), ("run.deadline", job["id"], "OPS-42"))
@@ -108,6 +112,9 @@ class WebhookHttpTests(unittest.TestCase):
         done = self.received.get(timeout=3)
         self.assertEqual((done["event"], done["summary"], done["label"], done["lane_id"]), ("run.done", "Change complete", "OPS-42", lane["id"]))
         self.assertEqual(done["cwd"], str(self.project.resolve()))
+        self.assertEqual((done["channel"], done["message"], done["session_id"]),
+                         ("conversation", "Change complete", lane["sessionId"]))
+        self.assertEqual(done["event_id"], f"{job['id']}:run.done")
 
 
 if __name__ == "__main__":

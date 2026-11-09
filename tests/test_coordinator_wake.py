@@ -17,17 +17,14 @@ class CoordinatorWakeTests(unittest.TestCase):
         self.project = Path(self.temp.name) / "project"
         self.project.mkdir()
         self.now = 0
-        specs = {
-            "melchior-lane-events": {"events": ["run.error", "run.deadline", "run.needs_input", "run.stalled"]},
-            "melchior-fail-completions": {"events": ["run.done"]},
-            "spawning-coordinator": {"events": ["daemon.up"], "lanes": ["different-lane"]},
-            "other-coordinator": {"events": ["run.done"], "lanes": ["different-lane"]},
-        }
-        for subscriber_id, filters in specs.items():
+        for subscriber_id, mode in (("owner", "conversation"), ("other", "conversation"),
+                                    ("monitor", "monitor")):
             add_subscriber(self.root, {
-                "id": subscriber_id,
+                "id": subscriber_id, "mode": mode,
                 "url": "https://example.invalid/hook",
-                **filters,
+                # Explicit ownership must not depend on these observer filters.
+                "events": ["daemon.up"] if mode == "conversation" else [],
+                "lanes": ["different-lane"] if mode == "conversation" else [],
             })
         self.dispatcher = WebhookDispatcher(self.root, retry_delays=())
         self.addCleanup(self.dispatcher.close)
@@ -44,11 +41,10 @@ class CoordinatorWakeTests(unittest.TestCase):
         self.lane = self.store.create_lane({"name": "coding", "cwd": str(self.project)})
         self.sid = self.lane["sessionId"]
 
-    def run_job(self, coordinator_subscriber_id=None):
+    def run_job(self, owner="owner"):
         with patch.object(self.store, "_run"):
             return self.store.lane_action(self.lane["id"], "run", {
-                "message": "work",
-                "coordinator_subscriber_id": coordinator_subscriber_id,
+                "message": "work", "coordinator_subscriber_id": owner,
             })
 
     def finish(self, job, status="completed", **extra):
@@ -60,206 +56,134 @@ class CoordinatorWakeTests(unittest.TestCase):
     def selected(self, event):
         return [(payload, ids) for payload, ids in self.enqueued if payload["event"] == event]
 
-    def test_healthy_completion_wakes_only_recorded_owner_once(self):
-        job = self.run_job("spawning-coordinator")
-        self.finish(job)
-        done = self.selected("run.done")
-        self.assertEqual(len(done), 1)
-        self.assertEqual(done[0][1], ["spawning-coordinator"])
-        self.assertNotIn("other-coordinator", done[0][1])
+    def test_final_response_reaches_only_owner_after_background_work_settles(self):
+        job = self.run_job()
+        text = "Verified full response. " * 40
+        self.store.event(self.sid, {"type": "message_end", "message": {
+            "role": "assistant", "content": [{"type": "text", "text": text}],
+        }})
+        self.store.event(self.sid, {"type": "prompt_result", "id": job["id"],
+                                    "status": "completed", "sessionSettled": False})
+        self.assertEqual(self.selected("run.done"), [])
+        self.store.event(self.sid, {"type": "session_settled"})
         self.finish(job)
         self.store.event(self.sid, {"type": "session_settled"})
-        self.assertEqual(len(self.selected("run.done")), 1)
+        done = self.selected("run.done")
+        self.assertEqual(len(done), 1)
+        payload, ids = done[0]
+        self.assertEqual(ids, ["owner"])
+        self.assertEqual(payload["message"], text)
+        self.assertEqual(payload["summary"], text[:300])
+        self.assertEqual((payload["channel"], payload["session_id"], payload["event_id"]),
+                         ("conversation", self.sid, f"{job['id']}:run.done"))
 
-    def test_healthy_completion_owned_by_gate_selects_gate_once(self):
-        job = self.run_job("melchior-fail-completions")
+    def test_ownerless_result_is_readable_without_broadcast(self):
+        job = self.run_job(None)
         self.finish(job)
-        self.assertEqual(self.selected("run.done")[0][1], ["melchior-fail-completions"])
-
-    def test_no_owner_adds_no_completion_wake(self):
-        job = self.run_job()
-        self.finish(job)
+        self.assertEqual(self.store.job(job["id"])["status"], "completed")
         self.assertEqual(self.selected("run.done")[0][1], [])
 
-    def test_noncompletion_events_keep_lane_routes_and_routine_approval_pending(self):
-        errored = self.run_job("spawning-coordinator")
-        self.finish(errored, status="error", error={"message": "provider failed"})
-        self.assertEqual(self.selected("run.error")[-1][1], ["melchior-lane-events"])
-
-        deadline = self.run_job("spawning-coordinator")
-        self.store.deadline(deadline["id"])
-        self.assertEqual(self.selected("run.deadline")[-1][1], ["melchior-lane-events"])
-        self.finish(deadline)
-
-        question = self.run_job("spawning-coordinator")
-        approvals = [
-            {"type": "extension_ui_request", "method": "confirm", "id": "approval",
-             "title": "Approve task for this session"},
-            {"type": "extension_ui_request", "method": "confirm", "id": "eval-approval",
-             "title": "Allow eval for this session"},
-            {"type": "extension_ui_request", "method": "confirm", "id": "tool-approval",
-             "title": "Allow-tool task for the session?"},
-        ]
-        for approval in approvals:
-            self.store.event(self.sid, approval)
-        self.assertEqual(self.store.job(question["id"])["status"], "waiting_input")
-        self.assertEqual(self.store.job(question["id"])["pendingInput"], approvals)
-        self.assertEqual(self.selected("run.needs_input"), [])
-        for approval in approvals:
-            self.store.event(self.sid, {"type": "extension_ui_request", "method": "cancel",
-                                        "targetId": approval["id"]})
-        self.finish(question)
-
-        human_question = self.run_job("spawning-coordinator")
-        self.store.event(self.sid, {"type": "extension_ui_request", "method": "input", "id": "human",
-                                    "title": "Which ticket?"})
-        self.assertEqual(self.selected("run.needs_input")[-1][1], ["melchior-lane-events"])
-
-        self.store.event(self.sid, {"type": "extension_ui_request", "method": "cancel", "targetId": "human"})
-        self.now = 1800
-        self.store.monitor_tick()
-        self.assertEqual(self.selected("run.stalled")[-1][1], ["melchior-lane-events"])
-        self.assertEqual(self.store.job(human_question["id"])["status"], "running")
-
-    def test_unknown_confirmations_and_human_questions_are_not_approval_filtered(self):
-        self.run_job("spawning-coordinator")
-        for index, (method, title) in enumerate([
-            ("confirm", "Approve production deployment?"),
-            ("confirm", "Approve this callback change?"),
-            ("ask", "Approve task for this session"),
-            ("confirm", "Approve this call  bash rm -rf /some/path"),
-        ]):
-            self.store.event(self.sid, {"type": "extension_ui_request", "method": method,
-                                        "id": f"human-{index}", "title": title})
-        decisions = self.selected("run.needs_input")
-        self.assertEqual([payload["summary"] for payload, _ in decisions],
-                         ["Approve production deployment?", "Approve this callback change?",
-                          "Approve task for this session", "Approve this call  bash rm -rf /some/path"])
-        self.assertTrue(all(ids == ["melchior-lane-events"] for _, ids in decisions))
-
-    def test_session_approval_with_external_effect_context_still_escalates(self):
-        self.run_job("spawning-coordinator")
-        contexts = [
-            {"message": "spend approval required"},
-            {"message": "deploy to production"},
-            {"message": "merge this change"},
-            {"questions": [{"question": "Which secret may the tool access?"}]},
-        ]
-        for index, context in enumerate(contexts):
-            self.store.event(self.sid, {"type": "extension_ui_request", "method": "confirm",
-                                        "id": f"sensitive-{index}",
-                                        "title": "Approve task for this session", **context})
-        decisions = self.selected("run.needs_input")
-        self.assertEqual(len(decisions), len(contexts))
-        self.assertTrue(all(ids == ["melchior-lane-events"] for _, ids in decisions))
-
-    def test_completed_failure_text_still_routes_as_done(self):
-        job = self.run_job("spawning-coordinator")
-        self.store.event(self.sid, {"type": "message_end", "message": {"role": "assistant", "content": [
-            {"type": "text", "text": "FAIL: task completed with a reported failure"},
-        ]}})
-        self.finish(job)
-        done = self.selected("run.done")[-1]
-        self.assertIn("FAIL: task completed with a reported failure", done[0]["summary"])
-        self.assertEqual(done[1], ["melchior-fail-completions", "spawning-coordinator"])
-
-    def test_ownerless_completed_failure_still_reaches_gate(self):
-        job = self.run_job()
-        self.store.event(self.sid, {"type": "message_end", "message": {"role": "assistant", "content": [
-            {"type": "text", "text": "Verdict: FAIL"},
-        ]}})
-        self.finish(job)
-        payload, ids = self.selected("run.done")[-1]
-        self.assertEqual(payload["status"], "completed")
-        self.assertEqual(ids, ["melchior-fail-completions"])
-
-    def test_approved_failure_grammar_and_first_verdict_precedence(self):
-        cases = [
-            ("", False),
-            ("An earlier attempt failed; the fix is now verified.", False),
-            ("Do not fail the completed task.", False),
-            ("Notes\n  vErDiCt: fAiL\nDetails", True),
-            ("Verdict: FAIL\nVerdict: PASS", True),
-            ("Verdict: PASS\nVerdict: FAIL", False),
-            ("Verdict: PASS+NOTES\nVerdict: FAIL\nBLOCKED", False),
-            ("FAIL: earlier attempt\nVerdict: PASS", False),
-            ("FAIL: task completed with a reported failure", True),
-            ("Details\n  fail: verification missing", True),
-            ("Quoted inline FAIL: is not a line-leading marker", False),
-            ("FAIL — P0", True),
-            ("fail – p1", True),
-            ("FAIL - P3", True),
-            ("FAIL - P4", False),
-            ("FAIL - P30", False),
-            ("Work is bLoCkEd pending input", True),
-            ("Work is unblocked", False),
-            ("ready.MD withheld pending verification", True),
-            ("READYxmd withheld", False),
-            ("Narrative Verdict: PASS\nFAIL: verification failed", True),
-            ("Verdict: FAILURE", False),
-        ]
-        for summary, failed in cases:
-            with self.subTest(summary=summary):
+    def test_result_content_does_not_route_to_another_coordinator(self):
+        for text in ("Verdict: FAIL", "BLOCKED", "Verdict: PASS", "READY.md withheld"):
+            with self.subTest(text=text):
                 job = self.run_job()
                 self.store.event(self.sid, {"type": "message_end", "message": {
-                    "role": "assistant", "content": [{"type": "text", "text": summary}],
+                    "role": "assistant", "content": [{"type": "text", "text": text}],
                 }})
                 self.finish(job)
-                payload, ids = self.selected("run.done")[-1]
-                self.assertEqual(payload["status"], "completed")
-                self.assertEqual(ids, ["melchior-fail-completions"] if failed else [])
+                self.assertEqual(self.selected("run.done")[-1][1], ["owner"])
 
-    def test_completion_gate_uses_truncated_payload_summary(self):
-        for prefix_length, failed in [(294, True), (295, False), (300, False)]:
-            with self.subTest(prefix_length=prefix_length):
-                summary = "x" * prefix_length + "\nFAIL:"
-                envelope, subscribers = self.dispatcher._prepare({"event": "run.done", "summary": summary})
-                self.assertEqual(envelope.payload["summary"], summary[:300])
-                self.assertEqual([s["id"] for s in subscribers],
-                                 ["melchior-fail-completions"] if failed else [])
+    def test_pending_dialog_is_actionable_and_not_hidden_by_its_title(self):
+        job = self.run_job()
+        request = {"type": "extension_ui_request", "method": "select", "id": "approval",
+                   "title": "Allow tool: bash", "options": ["Approve", "Approve bash for this session", "Deny"],
+                   "optionDetails": [{"description": "Run the command"}]}
+        self.store.event(self.sid, request)
+        self.store.event(self.sid, request)
+        self.now = 10000
+        self.store.monitor_tick()
+        self.assertEqual(self.store.job(job["id"])["pendingInput"], [request])
+        self.assertEqual(self.store.job(job["id"])["status"], "waiting_input")
+        decisions = self.selected("run.needs_input")
+        self.assertEqual(len(decisions), 1)
+        payload, ids = decisions[0]
+        self.assertEqual(ids, ["owner"])
+        self.assertEqual(payload["input"], request)
+        self.assertEqual(payload["input_id"], "approval")
+        self.assertEqual(payload["event_id"], f"{job['id']}:run.needs_input:approval")
+        self.assertEqual(self.selected("run.stalled"), [])
 
-    def test_completion_gate_uses_redacted_payload_summary(self):
-        add_subscriber(self.root, {"id": "redaction-source", "url": "https://example.invalid/hook",
-                                   "events": ["daemon.up"], "hmac_secret": "BLOCKED"})
-        self.dispatcher.reload()
-        envelope, subscribers = self.dispatcher._prepare({"event": "run.done", "summary": "BLOCKED"})
-        self.assertEqual(envelope.payload["summary"], "[redacted]")
-        self.assertEqual(subscribers, [])
+    def test_each_genuine_question_keeps_choices_and_its_own_identity(self):
+        job = self.run_job()
+        for ui_id in ("first", "second"):
+            request = {"type": "extension_ui_request", "method": "ask", "id": ui_id,
+                       "questions": [{"id": "destination", "question": "Which environment?",
+                                      "options": [{"label": "Staging", "description": "No production writes"},
+                                                  {"label": "Production"}], "recommended": 0}]}
+            self.store.event(self.sid, request)
+            payload, ids = self.selected("run.needs_input")[-1]
+            self.assertEqual(payload["input"], request)
+            self.assertEqual(ids, ["owner"])
+        self.assertEqual([p["event_id"] for p, _ in self.selected("run.needs_input")],
+                         [f"{job['id']}:run.needs_input:first", f"{job['id']}:run.needs_input:second"])
 
-    def test_generic_completion_subscribers_remain_selected_for_missing_summary(self):
-        add_subscriber(self.root, {"id": "generic-audit", "url": "https://example.invalid/hook",
-                                   "events": ["run.done"], "lanes": ["coding"]})
-        self.dispatcher.reload()
-        _, subscribers = self.dispatcher._prepare({"event": "run.done", "lane": "coding"})
-        self.assertEqual([s["id"] for s in subscribers], ["generic-audit"])
+    def test_required_confirmations_are_never_silenced_by_wording(self):
+        self.run_job()
+        for ui_id, title in (("routine", "Approve task for this session"),
+                             ("effect", "Approve production deployment?")):
+            self.store.event(self.sid, {"type": "extension_ui_request", "method": "confirm",
+                                        "id": ui_id, "title": title})
+        self.assertEqual([p["input_id"] for p, _ in self.selected("run.needs_input")],
+                         ["routine", "effect"])
 
-    def test_completed_failure_owner_is_gate_is_not_duplicated(self):
-        job = self.run_job("melchior-fail-completions")
-        self.store.event(self.sid, {"type": "message_end", "message": {
-            "role": "assistant", "content": [{"type": "text", "text": "Verdict: FAIL"}],
-        }})
-        self.finish(job)
-        self.assertEqual(self.selected("run.done")[0][1], ["melchior-fail-completions"])
+    def test_crash_abort_and_interruption_reach_owner_once(self):
+        for status in ("error", "aborted", "interrupted"):
+            job = self.run_job()
+            self.finish(job, status, error={"message": "Stopped before completion"})
+            self.finish(job, status)
+            payload, ids = self.selected("run.error")[-1]
+            self.assertEqual(ids, ["owner"])
+            self.assertEqual((payload["status"], payload["error"], payload["message"]),
+                             (status, "Stopped before completion", "Stopped before completion"))
+        self.assertEqual(len(self.selected("run.error")), 3)
+
+    def test_monitoring_never_wakes_conversation_subscribers(self):
+        job = self.run_job()
+        self.store.deadline(job["id"])
+        self.now = 1800
+        self.store.monitor_tick()
+        self.store.notifications.emit("daemon.up")
+        self.assertEqual([(p["event"], ids) for p, ids in self.enqueued],
+                         [("run.deadline", ["monitor"]), ("run.stalled", ["monitor"]),
+                          ("daemon.up", ["monitor"])])
+        self.assertTrue(all(p["channel"] == "monitor" for p, _ in self.enqueued))
+
+    def test_followup_uses_same_session_and_new_completion_identity(self):
+        first = self.run_job()
+        self.finish(first)
+        second = self.run_job()
+        self.finish(second)
+        done = self.selected("run.done")
+        self.assertEqual([p["session_id"] for p, _ in done], [self.sid, self.sid])
+        self.assertEqual([p["event_id"] for p, _ in done],
+                         [f"{first['id']}:run.done", f"{second['id']}:run.done"])
 
     def test_unknown_or_nonstring_coordinator_is_rejected_before_job_admission(self):
-        for coordinator_id in ("not-configured", 42, []):
-            with self.subTest(coordinator_id=coordinator_id):
+        for owner in ("not-configured", 42, []):
+            with self.subTest(owner=owner):
                 with self.assertRaisesRegex(ValueError, "coordinator_subscriber_id"):
-                    self.run_job(coordinator_id)
+                    self.run_job(owner)
                 self.assertEqual(self.store.jobs, {})
 
-    def test_restoring_completed_job_does_not_emit_completion_again(self):
-        job = self.run_job("spawning-coordinator")
-        self.assertEqual(job["coordinator_subscriber_id"], "spawning-coordinator")
-        self.assertEqual(self.store.job(job["id"])["coordinator_subscriber_id"], "spawning-coordinator")
+    def test_restoring_completed_job_does_not_repeat_conversation(self):
+        job = self.run_job()
         self.finish(job)
-        self.assertEqual(len(self.selected("run.done")), 1)
         self.store.close()
         self.enqueued.clear()
         restored = Store(self.root, self.dispatcher, clock=lambda: self.now)
         self.addCleanup(restored.close)
+        self.assertEqual(restored.job(job["id"])["coordinator_subscriber_id"], "owner")
         self.assertEqual(restored.job(job["id"])["status"], "completed")
-        self.assertEqual(restored.job(job["id"])["coordinator_subscriber_id"], "spawning-coordinator")
         self.assertEqual(self.enqueued, [])
 
 

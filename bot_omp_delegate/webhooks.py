@@ -23,21 +23,26 @@ from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 EVENTS = frozenset({"run.done", "run.error", "run.deadline", "run.needs_input", "run.stalled", "lane.idle", "daemon.up"})
-_SUBSCRIBER_FIELDS = {"id", "url", "auth_header", "auth_value", "events", "lanes", "hmac_secret", "signature_header"}
+_SUBSCRIBER_FIELDS = {"id", "url", "auth_header", "auth_value", "events", "lanes", "hmac_secret", "signature_header", "mode"}
 _HEADER = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _RESERVED = {"content-type", "x-omp-delivery", "x-omp-event", "host", "content-length", "transfer-encoding", "connection", "trailer", "upgrade", "expect", "proxy-authorization"}
-_MELCHIOR_COMPLETION_GATE = "melchior-fail-completions"
-_VERDICT = re.compile(r"(?im)^\s*Verdict:\s*(FAIL|PASS(?:\+NOTES)?)\b")
-_COMPLETED_FAIL = re.compile(
-    r"(?im)^\s*FAIL:|\bFAIL\s+[—–-]\s*P[0-3]\b|\bBLOCKED\b|READY\.md withheld")
+CONVERSATIONAL = frozenset({"run.done", "run.error", "run.needs_input"})
+_IDENTIFIERS = frozenset({"id", "input_id", "event_id", "job_id", "session_id", "lane_id", "type", "method", "event", "channel"})
 
 
-def _completed_fail(summary):
-    verdict = _VERDICT.search(summary)
-    if verdict is not None:
-        return verdict.group(1)[0] in "Ff"
-    return _COMPLETED_FAIL.search(summary) is not None
+def _redact(value, secrets):
+    # Structural identifiers/keys are never rewritten; only string VALUES are.
+    if isinstance(value, str):
+        for secret in secrets:
+            if secret in value:
+                value = value.replace(secret, "[redacted]")
+        return value
+    if isinstance(value, list):
+        return [_redact(item, secrets) for item in value]
+    if isinstance(value, dict):
+        return {key: item if key in _IDENTIFIERS else _redact(item, secrets) for key, item in value.items()}
+    return value
 
 
 class ConfigError(ValueError):
@@ -82,6 +87,9 @@ def _subscriber(item):
     except (ValueError, UnicodeError):
         raise _invalid() from None
     result = dict(item)
+    result["mode"] = item.get("mode", "monitor")
+    if not isinstance(result["mode"], str) or result["mode"] not in {"conversation", "monitor"}:
+        raise _invalid()
     result["signature_header"] = item.get("signature_header", "X-OMP-Signature")
     for key in ("auth_header", "signature_header"):
         if key in result and (not isinstance(result[key], str) or not _HEADER.fullmatch(result[key]) or result[key].lower() in _RESERVED):
@@ -168,7 +176,7 @@ def load_config(root):
 
 
 def _safe(config):
-    return {**config, "subscribers": [{"id": s["id"], "url": "[redacted]", "auth_configured": "auth_value" in s, "signature_configured": "hmac_secret" in s, "events": list(s.get("events", [])), "lanes": list(s.get("lanes", []))} for s in config["subscribers"]]}
+    return {**config, "subscribers": [{"id": s["id"], "url": "[redacted]", "auth_configured": "auth_value" in s, "signature_configured": "hmac_secret" in s, "events": list(s.get("events", [])), "lanes": list(s.get("lanes", [])), "mode": s.get("mode", "monitor")} for s in config["subscribers"]]}
 
 
 def list_config(root):
@@ -346,26 +354,32 @@ class WebhookDispatcher:
         with self._lock:
             if self._config_error:
                 raise _invalid()
-            safe = dict(payload, version=1)
-            summary = str(safe.get("summary", ""))
+            secrets = sorted((s[k] for s in self._config["subscribers"] for k in ("url", "auth_value", "hmac_secret") if s.get(k)), key=len, reverse=True)
+            safe = _redact(dict(payload, version=1), secrets)
             # Redact before truncation; otherwise a credential can straddle char 300.
-            secrets = {s[k] for s in self._config["subscribers"] for k in ("url", "auth_value", "hmac_secret") if s.get(k)}
-            for secret in sorted(secrets, key=len, reverse=True):
-                summary = summary.replace(secret, "[redacted]")
-            safe["summary"] = summary[:300]
-            # Classify the exact delivered summary; do not infer an RPC outcome.
-            healthy_completion = payload["event"] == "run.done" and not _completed_fail(safe["summary"])
-            # Explicit ownership overrides broadcast filters. The MELCHIOR gate
-            # gets ordinary completed-fail matches, never unowned healthy work.
-            subscribers = [
-                s for s in self._config["subscribers"]
-                if bypass_filters
-                or (payload["event"] == "run.done" and s["id"] == coordinator_subscriber_id)
-                or ((not s.get("events") or payload["event"] in s["events"])
-                    and (not s.get("lanes") or payload.get("lane") in s["lanes"]
-                         or payload.get("lane_id") in s["lanes"])
-                    and not (healthy_completion and s["id"] == _MELCHIOR_COMPLETION_GATE))
-            ]
+            # Only the bounded summary preview is truncated; full message/input are not.
+            safe["summary"] = str(safe.get("summary", ""))[:300]
+            event = payload["event"]
+            # Event semantics, never payload text/channel overrides, select the route.
+            channel = "conversation" if event in CONVERSATIONAL else "monitor"
+            safe["channel"] = channel
+            if bypass_filters:
+                subscribers = list(self._config["subscribers"])
+            elif channel == "conversation":
+                # Conversational events reach only the recorded owner, overriding
+                # that subscriber's filters; ownerless jobs never broadcast.
+                subscribers = [s for s in self._config["subscribers"]
+                               if coordinator_subscriber_id is not None and s["id"] == coordinator_subscriber_id]
+            else:
+                # Operational events use ordinary event/lane filters and never
+                # reach conversation-mode subscribers.
+                subscribers = [
+                    s for s in self._config["subscribers"]
+                    if s.get("mode", "monitor") == "monitor"
+                    and (not s.get("events") or event in s["events"])
+                    and (not s.get("lanes") or safe.get("lane") in s["lanes"]
+                         or safe.get("lane_id") in s["lanes"])
+                ]
             return _Envelope(safe), subscribers
 
     def _submit(self, envelope, subscribers, batch=None):

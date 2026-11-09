@@ -2,30 +2,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
-import re
+import copy
 import time
-
-
-_SESSION_APPROVAL = re.compile(
-    r"(?:(?:approve|allow) (?:task|eval)|allow[- ](?:tool|eval)(?: (?:task|eval))?) "
-    r"for (?:this|the) session[?.!]?", re.I)
-# Keep external-effect decisions visible, matching the coordinator receiver gate.
-_EXTERNAL_EFFECT = re.compile(
-    r"\b(?:spend|pay|payment|purchase|buy|charge|billing|cost|budget|prod|production|"
-    r"deploy|release|publish|merge|squash|ready_for_review|github|git push|"
-    r"secret|credential|token|password|tunnel|whatsapp|send|email|delete|"
-    r"classification|solomon|sign[- ]?off)\b", re.I)
-
-
-def _is_routine_approval(request):
-    if request.get("method") != "confirm" or not isinstance(request.get("title"), str):
-        return False
-    title = request["title"].strip()
-    # Match the existing receiver's session-scoped gate, not generic tool
-    # confirmations: a tool-call title alone does not establish routine work.
-    return bool(_SESSION_APPROVAL.fullmatch(title)) and not _EXTERNAL_EFFECT.search(
-        json.dumps(request, ensure_ascii=False))
 
 
 class Notifications:
@@ -40,23 +18,35 @@ class Notifications:
     def enabled(self):
         return self.dispatcher is not None and self.dispatcher.enabled
 
-    def emit(self, event, job=None, session=None, lane=None, summary=None):
+    def emit(self, event, job=None, session=None, lane=None, summary=None, input_request=None):
         if not self.enabled:
             return
         job, session, lane = job or {}, session or {}, lane or {}
+        conversational = event in {"run.done", "run.error", "run.needs_input"}
         payload = {
             "version": 1, "event": event,
+            "channel": "conversation" if conversational else "monitor",
+            "session_id": session.get("id", job.get("sessionId", "")),
             "lane": lane.get("name", ""), "lane_id": lane.get("id", ""),
             "job_id": job.get("id", ""), "status": job.get("status", "idle" if lane else "up"),
             "cwd": session.get("cwd", ""), "branch": "", "last_commit_sha": "",
             "summary": str(summary if summary is not None else job.get("finalMessage") or event),
             "ts": datetime.now(timezone.utc).isoformat(),
         }
+        key = f"{payload['job_id']}:{event}"
+        if input_request is not None:
+            payload["input_id"] = input_request["id"]
+            payload["input"] = copy.deepcopy(input_request)
+            key += f":{input_request['id']}"
+        elif event in {"run.done", "run.error"}:
+            payload["message"] = job.get("finalMessage") or job.get("error") or ""
+            payload["error"] = job.get("error")
+        payload["event_id"] = key if conversational else f"{key}:{payload['ts']}"
         if job.get("label"):
             payload["label"] = job["label"]
         try:
             # Only bounded enqueue is allowed here: caller may hold Store.cv.
-            owner = job.get("coordinator_subscriber_id") if event == "run.done" else None
+            owner = job.get("coordinator_subscriber_id") if conversational else None
             if owner is None:
                 self.dispatcher.emit(payload)
             else:
@@ -117,12 +107,10 @@ class Notifications:
             if not ui_id or ui_id in state["input_ids"]:
                 continue
             state["input_ids"].add(ui_id)
-            if _is_routine_approval(request):
-                continue
             questions = request.get("questions")
             first = questions[0] if isinstance(questions, list) and questions and isinstance(questions[0], dict) else {}
             summary = request.get("title") or first.get("question") or "Question or approval requires input"
-            self.emit("run.needs_input", job, session, lane, summary)
+            self.emit("run.needs_input", job, session, lane, summary, input_request=request)
 
     def finished(self, job, session, lane):
         self.runs.pop(job["id"], None)

@@ -1,6 +1,6 @@
 ---
 name: bot-omp-delegate
-description: Run delegated coding tasks through OMP lanes; advanced.md covers archive, deletion, configuration, assignment, and subagents.
+description: Run delegated coding tasks through OMP lanes; advanced.md covers webhooks, session retention/configuration, lane assignment/removal, and subagents.
 ---
 
 # Delegate work to OMP
@@ -15,15 +15,18 @@ Use the installed absolute path to `scripts/omp-delegate` as `$D`. The Grok Mac 
 
 ## Dispatch
 
-Assign exactly one low-effort waiter subagent. Give it the absolute delegate path, lane id, exact prompt, duration, and whether deadline interruption is authorized.
+For conversational webhook delivery, set the coordinator subscriber to `mode: "conversation"` and submit once with its ID:
 
 ```sh
-"$D" lane run LANE_ID "EXACT TASK. Do not commit or push." --max-hours 6
+"$D" lane run LANE_ID "EXACT TASK. Do not commit or push." \
+  --detach --coordinator-subscriber-id COORDINATOR_ID --max-hours 6
 ```
 
-Use a foreground Shell call with the platform's long blocking allowance. `lane run` returns a job id before waiting; running means admitted, not complete. If the call returns a shell handle, keep waiting on that same handle. Submit once only. The default approval tier is always-ask; waiters escalate pending UI requests to the coordinator, which resolves or obtains owner authorization before answering. Load `advanced.md` for the exact answer command/forms.
+The recorded owner alone receives `run.done`, `run.error`, and `run.needs_input`; owner selection overrides event/lane filters. Ownerless jobs remain inspectable with `read`/`wait` and send no conversational webhook. The subscriber's monitor mode is not suitable for conversational delivery.
 
-The main bot stays free and resumes on the waiter report. If a question appears, escalate it while preserving the foreground wait. When the task settles, report the lane, job id, terminal status, error, concise final message, unresolved input, and verification limits.
+Grok receives a question on `run.needs_input`, answers through the existing `answer` command, and receives the full final response on settlement. Continue follow-up work in the same lane/session. The `summary` field is only a bounded preview; use the full message/input fields. Receivers deduplicate by stable `event_id` before invoking Grok; `X-OMP-Delivery` is stable across HTTP retries but delivery is not exactly-once.
+
+Use detached job plus webhook as the single conversational wake path. Do not also run a foreground waiter that wakes Grok. Use `read`/`wait` for inspection or recovery, not progress notifications. Operational notifications are routed separately to monitor subscribers and must not wake the model. A waiter deadline does not cancel the job unless interruption was explicitly selected.
 
 ## Continue or release
 
@@ -41,4 +44,4 @@ Only settled work is complete; a yielded agent may still have background jobs. A
 
 One lane coordinates a worktree; it does not authorize access. Labels are not security boundaries, and clients sharing the daemon token share control. The owner controls approval policy. Waiters make no product decisions or permission grants. OMP is not an OS sandbox. Interruption/shutdown may leave descendants, detached tools, or external effects; do not claim full process-tree cleanup.
 
-Load [`advanced.md`](advanced.md) only for session archive/deletion/configuration, lane assignment/removal, or subagent procedures.
+Load [`advanced.md`](advanced.md) for webhook configuration/receivers, or for session archive/deletion/configuration, lane assignment/removal, and subagent procedures.

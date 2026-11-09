@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .omp-delegate/
 .omp/
+.codegraph/
 .env
 .env.*
 *.log

@@ -90,28 +90,22 @@ class EventTests(unittest.TestCase):
         self.store.monitor_tick()
         self.assertEqual(self.names()[-1], "run.stalled")
 
-    def test_session_task_approval_stays_pending_without_outer_notification(self):
+    def test_unanswered_session_approval_is_visible_and_suppresses_stalls(self):
         job = self.run_job()
         approval = {"type": "extension_ui_request", "method": "confirm", "id": "session-approval",
                     "title": "Approve task for this session"}
         self.event(approval)
-        self.assertEqual(self.store.job(job["id"])["status"], "waiting_input")
-        self.assertEqual(self.store.job(job["id"])["pendingInput"], [approval])
-        self.assertEqual(self.names(), [])
-
         self.now = 10000
         self.store.monitor_tick()
-        self.assertEqual(self.names(), [])
+        self.assertEqual(self.store.job(job["id"])["status"], "waiting_input")
         self.assertEqual(self.store.job(job["id"])["pendingInput"], [approval])
-
+        self.assertEqual(self.names(), ["run.needs_input"])
+        self.assertEqual(self.sink.events[0]["input"], approval)
         self.event({"type": "extension_ui_request", "method": "cancel", "targetId": "session-approval"})
         self.assertEqual(self.store.job(job["id"])["pendingInput"], [])
-        self.now += 1799
+        self.now += 1800
         self.store.monitor_tick()
-        self.assertNotIn("run.stalled", self.names())
-        self.now += 1
-        self.store.monitor_tick()
-        self.assertEqual(self.names(), ["run.stalled"])
+        self.assertEqual(self.names(), ["run.needs_input", "run.stalled"])
 
     def test_stall_threshold_deduplication_and_actual_output_rearms(self):
         job = self.run_job()

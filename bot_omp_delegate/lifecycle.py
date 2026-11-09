@@ -464,7 +464,10 @@ class Store:
                     changed = True
             if kind == "extension_ui_request":
                 if frame.get("method") in INPUT_METHODS:
-                    job["pendingInput"].append(frame)
+                    # RPC dialogs are real caller decisions, not progress events.
+                    # Replayed frames must not create duplicate pending questions.
+                    if not any(p["id"] == frame["id"] for p in job["pendingInput"]):
+                        job["pendingInput"].append(frame)
                 elif frame.get("method") == "cancel":
                     job["pendingInput"] = [p for p in job["pendingInput"] if p["id"] != frame.get("targetId")]
                 job["status"] = "waiting_input" if job["pendingInput"] else "running"

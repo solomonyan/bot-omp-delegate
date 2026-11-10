@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import gzip
 import json
+import zlib
 import os
 from pathlib import Path
 import re
@@ -890,7 +891,7 @@ class Store:
             if job is not None and job["sessionId"] != sid:
                 raise Conflict("Purge intent refers to another session's job")
             self.jobs.pop(jid, None)
-            for suffix in (".json", ".jsonl"):
+            for suffix in (".json", ".jsonl", ".jsonl.gz"):
                 (self.root / "jobs" / (jid + suffix)).unlink(missing_ok=True)
         if directory.exists():
             shutil.rmtree(directory)
@@ -917,20 +918,46 @@ class Store:
         with self.cv:
             self.job(jid)
             directory = self.root / "jobs"
-            result = []
             plain = directory / f"{jid}.jsonl"
-            # gzip retains the source until the archive is complete. Prefer it
-            # while both exist rather than opening a partially written archive.
-            path = plain if plain.exists() else directory / f"{jid}.jsonl.gz"
-            if path.exists():
-                opener = gzip.open if path.suffix == ".gz" else open
-                with opener(path, "rt", encoding="utf-8") as stream:
-                    for line in stream:
-                        event = json.loads(line)
-                        if event["seq"] >= after:
-                            result.append(event)
-                            if len(result) == 100:
-                                break
+            archive = directory / f"{jid}.jsonl.gz"
+            sources = {}
+
+            # Read plain first: an open descriptor survives gzip's unlink. If
+            # opening loses that race, the archive is opened afterward instead.
+            for path in (plain, archive):
+                # A rename/unlink can race either stat or open. Retry a missing
+                # source once; a surviving counterpart remains usable.
+                for attempt in range(2):
+                    try:
+                        stream = gzip.open(path, "rt", encoding="utf-8") if path == archive else path.open("rt", encoding="utf-8")
+                    except FileNotFoundError:
+                        if attempt == 0:
+                            continue
+                        break
+                    events = []
+                    try:
+                        with stream:
+                            for line in stream:
+                                try:
+                                    event = json.loads(line)
+                                except json.JSONDecodeError:
+                                    if not line.endswith("\n"):
+                                        break
+                                    raise
+                                if event["seq"] >= after:
+                                    events.append(event)
+                                    if len(events) == 100:
+                                        break
+                    except (EOFError, gzip.BadGzipFile, zlib.error, UnicodeDecodeError):
+                        pass
+                    sources[path] = events
+                    break
+
+            merged = {}
+            for path in (plain, archive):
+                for event in sources.get(path, ()):
+                    merged.setdefault(event["seq"], event)
+            result = [merged[seq] for seq in sorted(merged)[:100]]
             return {"events": result, "next": result[-1]["seq"] + 1 if result else after}
 
     def close(self):

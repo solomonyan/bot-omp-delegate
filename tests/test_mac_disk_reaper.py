@@ -213,9 +213,168 @@ class MacDiskReaperSafetyTests(unittest.TestCase):
             git("-C", main, "push", "origin", "saved-work")
             # Update this worktree's shared remote refs; never fetch a real remote.
             self.assertTrue(reaper._git_is_safe(candidate))
-            self.assertEqual(reaper._delete_candidate(candidate, "worktree", False), "removed")
+            with patch.object(reaper, "_guard_paths", return_value=[]):
+                self.assertEqual(reaper._delete_candidate(candidate, "worktree", False), "removed")
             self.assertFalse(candidate.exists())
             self.assertEqual((main / "tracked").read_text(), "other branch")
+
+    def test_unpublished_stash_tag_and_arbitrary_refs_are_kept(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, remote = root / "source", root / "remote.git"
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture",
+                     "-c", "user.email=fixture@example.invalid", *map(str, args)],
+                    check=True, capture_output=True, text=True, env=env,
+                )
+
+            git("init", "--initial-branch=main", source)
+            git("init", "--bare", remote)
+            (source / "tracked").write_text("published")
+            git("-C", source, "add", "tracked")
+            git("-C", source, "commit", "-m", "published")
+            git("-C", source, "remote", "add", "origin", remote)
+            git("-C", source, "push", "-u", "origin", "main")
+            git("--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/main")
+
+            # A stash whose base is remote-reachable is still user work.
+            clone = root / "stash-clone"
+            git("clone", remote, clone)
+            unpublished_stash = root / "unpublished-stash"
+            git("clone", remote, unpublished_stash)
+            (unpublished_stash / "local").write_text("unpublished base")
+            git("-C", unpublished_stash, "add", "local")
+            git("-C", unpublished_stash, "commit", "-m", "unpublished stash base")
+            (unpublished_stash / "tracked").write_text("stashed change")
+            git("-C", unpublished_stash, "stash", "push", "-m", "unpublished-base stash")
+            self.assertEqual(reaper._git_unsafe_reason(unpublished_stash), "git_stash_present")
+            (clone / "tracked").write_text("stashed change")
+            git("-C", clone, "stash", "push", "-m", "published-base stash")
+            self.assertEqual(reaper._git_unsafe_reason(clone), "git_stash_present")
+
+            # A tag can be the only local ref retaining a detached unpublished commit.
+            tag_clone = root / "tag-clone"
+            git("clone", remote, tag_clone)
+            git("-C", tag_clone, "checkout", "--detach")
+            (tag_clone / "tagged").write_text("tag only")
+            git("-C", tag_clone, "add", "tagged")
+            git("-C", tag_clone, "commit", "-m", "tag-only unpublished")
+            git("-C", tag_clone, "tag", "local-only")
+            git("-C", tag_clone, "checkout", "main")
+            self.assertEqual(reaper._git_unsafe_reason(tag_clone), "git_unpublished_refs")
+
+            # Non-standard refs count too, not just branches and tags.
+            ref_clone = root / "ref-clone"
+            git("clone", remote, ref_clone)
+            git("-C", ref_clone, "checkout", "--detach")
+            (ref_clone / "ref-only").write_text("ref only")
+            git("-C", ref_clone, "add", "ref-only")
+            git("-C", ref_clone, "commit", "-m", "ref-only unpublished")
+            commit = git("-C", ref_clone, "rev-parse", "HEAD").stdout.strip()
+            git("-C", ref_clone, "update-ref", "refs/saved/only", commit)
+            git("-C", ref_clone, "checkout", "main")
+            self.assertEqual(reaper._git_unsafe_reason(ref_clone), "git_unpublished_refs")
+
+    def test_sibling_worktree_observes_common_stash_and_tag_refs(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main, remote, sibling = root / "main", root / "remote.git", root / "sibling"
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture",
+                     "-c", "user.email=fixture@example.invalid", *map(str, args)],
+                    check=True, capture_output=True, text=True, env=env,
+                )
+
+            git("init", "--initial-branch=main", main)
+            git("init", "--bare", remote)
+            (main / "tracked").write_text("published")
+            git("-C", main, "add", "tracked")
+            git("-C", main, "commit", "-m", "published")
+            git("-C", main, "remote", "add", "origin", remote)
+            git("-C", main, "push", "-u", "origin", "main")
+            git("-C", main, "worktree", "add", "--track", "-b", "sibling", sibling, "origin/main")
+            self.assertTrue(reaper._git_is_safe(sibling))
+
+            (main / "tracked").write_text("stash shared")
+            git("-C", main, "stash", "push", "-m", "common stash")
+            self.assertEqual(reaper._git_unsafe_reason(sibling), "git_stash_present")
+            git("-C", main, "stash", "clear")
+
+            git("-C", main, "checkout", "--detach")
+            (main / "tagged").write_text("tag shared")
+            git("-C", main, "add", "tagged")
+            git("-C", main, "commit", "-m", "common tag commit")
+            git("-C", main, "tag", "shared-unpublished")
+            git("-C", main, "checkout", "main")
+            self.assertEqual(reaper._git_unsafe_reason(sibling), "git_unpublished_refs")
+
+    def test_new_active_overlap_at_deletion_boundary_prevents_all_removals(self):
+        import contextlib
+        import io
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main, remote, candidate, copy = (
+                root / "main", root / "remote.git", root / "candidate", root / "copy",
+            )
+            jobs, cli = root / "jobs", root / "omp-delegate"
+            jobs.mkdir()
+            cli.write_text("#!/bin/sh\nprintf '%s\\n' '{\"lanes\":[]}'\n")
+            cli.chmod(0o755)
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture",
+                     "-c", "user.email=fixture@example.invalid", *map(str, args)],
+                    check=True, capture_output=True, text=True, env=env,
+                )
+
+            git("init", "--initial-branch=main", main)
+            git("init", "--bare", remote)
+            (main / "tracked").write_text("published")
+            git("-C", main, "add", "tracked")
+            git("-C", main, "commit", "-m", "published")
+            git("-C", main, "remote", "add", "origin", remote)
+            git("-C", main, "push", "-u", "origin", "main")
+            git("--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/main")
+            git("-C", main, "worktree", "add", "--track", "-b", "candidate", candidate, "origin/main")
+            git("clone", remote, copy)
+            rows = []
+            real_guard_paths = reaper._guard_paths
+            real_candidate_size = reaper._candidate_size
+
+            def size_with_new_active_job(path):
+                (jobs / "active.json").write_text(json.dumps({"status": "running", "cwd": str(path)}))
+                return real_candidate_size(path)
+
+            with patch.object(
+                reaper, "_guard_paths",
+                side_effect=lambda: real_guard_paths(jobs_dir=jobs, cli=cli),
+            ), patch.object(reaper, "_candidate_size", side_effect=size_with_new_active_job), \
+                 patch.object(reaper, "discover_candidates", return_value=[candidate.resolve(), copy.resolve()]), \
+                 patch.object(reaper, "_cleanup_old_logs", return_value=(0, 0, [])), \
+                 patch.object(reaper, "_chrome_processes", return_value=[]), \
+                 patch.object(reaper, "_snapshot_report", return_value=0), \
+                 patch.object(reaper, "_record", side_effect=rows.append), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                reaper._run_once(False)
+            self.assertTrue(candidate.is_dir())
+            self.assertTrue(copy.is_dir())
+            self.assertEqual(
+                sum(row.get("reason") == "active_job_or_lane_overlap" for row in rows), 2,
+            )
 
     def test_dry_run_never_removes_candidate(self):
         with tempfile.TemporaryDirectory() as directory:

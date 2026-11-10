@@ -338,19 +338,57 @@ def _git_kind(candidate: Path) -> str | None:
     raise SafetyError("git metadata is ambiguous")
 
 
-def _git_is_safe(candidate: Path) -> bool:
+def _git_unsafe_reason(candidate: Path) -> str | None:
+    git = ["git", "-C", str(candidate)]
     try:
-        status = _run(["git", "-C", str(candidate), "status", "--porcelain", "--untracked-files=all"])
-        upstream = _run(["git", "-C", str(candidate), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        ahead = _run(["git", "-C", str(candidate), "rev-list", "--count", "@{u}..HEAD"])
-        unpublished = _run(["git", "-C", str(candidate), "rev-list", "--count", "--branches", "HEAD", "--not", "--remotes"])
+        status = _run(git + ["status", "--porcelain", "--untracked-files=all"])
+        upstream = _run(git + ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        refs = _run(git + ["for-each-ref", "--format=%(refname)", "refs"])
+        stash = _run(git + ["show-ref", "--verify", "--quiet", "refs/stash"])
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return (
-        status.returncode == 0 and not status.stdout and upstream.returncode == 0
-        and bool(upstream.stdout.strip()) and ahead.returncode == 0 and ahead.stdout.strip() == "0"
-        and unpublished.returncode == 0 and unpublished.stdout.strip() == "0"
-    )
+        return "git_inspection_failed"
+    if refs.returncode:
+        return "git_dirty_untracked_or_unpushed_or_unknown"
+    if stash.returncode == 0:
+        # Any stash is user work, even when its commit is already published.
+        try:
+            stash_commit = _run(git + ["rev-parse", "--verify", "refs/stash^{commit}"])
+        except (OSError, subprocess.TimeoutExpired):
+            return "git_stash_unknown"
+        if stash_commit.returncode:
+            return "git_stash_unknown"
+        return "git_stash_present"
+    if stash.returncode != 1:
+        return "git_stash_unknown"
+    for ref in refs.stdout.splitlines():
+        if ref.startswith("refs/remotes/"):
+            continue
+        try:
+            commit = _run(git + ["rev-parse", "--verify", f"{ref}^{{commit}}"])
+            if commit.returncode or not commit.stdout.strip():
+                return "git_ref_unknown"
+            unpublished = _run(git + [
+                "rev-list", "--count", commit.stdout.strip(), "--not", "--remotes",
+            ])
+        except (OSError, subprocess.TimeoutExpired):
+            return "git_ref_unknown"
+        if unpublished.returncode or not unpublished.stdout.strip():
+            return "git_ref_unknown"
+        if unpublished.stdout.strip() != "0":
+            return "git_unpublished_refs"
+    if status.returncode or status.stdout or upstream.returncode or not upstream.stdout.strip():
+        return "git_dirty_untracked_or_unpushed_or_unknown"
+    try:
+        ahead = _run(git + ["rev-list", "--count", "@{u}..HEAD"])
+    except (OSError, subprocess.TimeoutExpired):
+        return "git_ref_unknown"
+    if ahead.returncode or ahead.stdout.strip() != "0":
+        return "git_unpublished_refs"
+    return None
+
+
+def _git_is_safe(candidate: Path) -> bool:
+    return _git_unsafe_reason(candidate) is None
 
 
 def _git_common_dir(candidate: Path) -> Path | None:
@@ -397,6 +435,15 @@ def _delete_candidate(
 ) -> str:
     if dry_run:
         return "would_remove"
+    try:
+        fresh_paths = _guard_paths()
+    except (SafetyError, OSError, subprocess.TimeoutExpired) as exc:
+        return f"guard_unknown:{exc}"
+    if any(_overlaps(candidate, active) for active in fresh_paths):
+        return "active_job_or_lane_overlap"
+    if candidate.is_symlink() or not candidate.is_dir():
+        return "candidate_changed"
+    # Dispatch has no shared lock with this reaper: a final syscall-sized race remains.
     if kind == "worktree":
         common_dir = common_dir or _git_common_dir(candidate)
         if common_dir is None:
@@ -412,7 +459,6 @@ def _delete_candidate(
         return "removed"
     except OSError:
         return "remove_failed"
-
 
 
 def _cleanup_old_logs(now: float, dry_run: bool) -> tuple[int, int, list[dict[str, object]]]:
@@ -526,9 +572,11 @@ def _run_once(dry_run: bool) -> int:
         if kind is None and candidate.parent != Path("/private/tmp").resolve():
             report.append({"action": "kept", "reason": "git_metadata_unknown", "path": str(candidate)})
             continue
-        if kind and not _git_is_safe(candidate):
-            report.append({"action": "kept", "reason": "git_dirty_untracked_or_unpushed_or_unknown", "path": str(candidate)})
-            continue
+        if kind:
+            git_reason = _git_unsafe_reason(candidate)
+            if git_reason:
+                report.append({"action": "kept", "reason": git_reason, "path": str(candidate)})
+                continue
         common_dir = None
         if kind == "worktree":
             common_dir = _git_common_dir(candidate)
@@ -540,26 +588,27 @@ def _run_once(dry_run: bool) -> int:
             report.append({"action": "kept", "reason": "candidate_size_unknown", "path": str(candidate)})
             continue
         if not dry_run:
-            if kind and not _git_is_safe(candidate):
-                report.append({"action": "kept", "reason": "git_state_changed_or_unknown", "path": str(candidate)})
-                continue
+            if kind:
+                git_reason = _git_unsafe_reason(candidate)
+                if git_reason:
+                    report.append({"action": "kept", "reason": git_reason, "path": str(candidate)})
+                    continue
             if candidate.is_symlink() or not candidate.is_dir():
                 report.append({"action": "kept", "reason": "candidate_changed", "path": str(candidate)})
-                continue
-            try:
-                fresh_paths = _guard_paths()
-            except SafetyError as exc:
-                report.append({"action": "kept", "reason": str(exc), "path": str(candidate)})
-                continue
-            if any(_overlaps(candidate, active) for active in fresh_paths):
-                report.append({"action": "kept", "reason": "active_job_or_lane_overlap", "path": str(candidate)})
                 continue
             worktrees = (HOME / ".omp" / "wt").resolve()
             if candidate.parent == worktrees and not _owner_is_orphan(candidate):
                 report.append({"action": "kept", "reason": "owner_no_longer_orphaned", "path": str(candidate)})
                 continue
         action = _delete_candidate(candidate, kind, dry_run, common_dir)
-        report.append({"action": action, "path": str(candidate), "size_bytes": size, "size_gb": round(size / 1e9, 3)})
+        if action == "active_job_or_lane_overlap":
+            report.append({"action": "kept", "reason": action, "path": str(candidate)})
+        elif action.startswith("guard_unknown:"):
+            report.append({"action": "kept", "reason": action.removeprefix("guard_unknown:"), "path": str(candidate)})
+        elif action == "candidate_changed":
+            report.append({"action": "kept", "reason": action, "path": str(candidate)})
+        else:
+            report.append({"action": action, "path": str(candidate), "size_bytes": size, "size_gb": round(size / 1e9, 3)})
     if guard_error:
         log_count, log_bytes, log_rows = 0, 0, []
     else:

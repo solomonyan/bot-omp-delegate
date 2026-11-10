@@ -1,3 +1,5 @@
+import gzip
+import json
 from datetime import datetime
 from pathlib import Path
 import tempfile
@@ -193,6 +195,83 @@ class EventTests(unittest.TestCase):
             target.write(source.read())
         path.unlink()
         self.assertEqual(self.store.events(job["id"], 1)["events"], stored["events"][1:])
+
+    def test_archive_and_resumed_plain_are_merged_deduplicated_and_paginated(self):
+        job = self.run_job()
+        directory = self.store.root / "jobs"
+        plain = directory / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        archived = [{"seq": seq, "type": "archived", "value": seq} for seq in range(120)]
+        with gzip.open(archive, "wt", encoding="utf-8") as stream:
+            for event in archived:
+                stream.write(json.dumps(event) + "\n")
+        resumed = [{"seq": seq, "type": "resumed", "value": seq} for seq in range(119, 140)]
+        plain.write_text("".join(json.dumps(event) + "\n" for event in resumed))
+
+        first = self.store.events(job["id"], 0)
+        self.assertEqual([event["seq"] for event in first["events"]], list(range(100)))
+        self.assertEqual(first["next"], 100)
+        second = self.store.events(job["id"], first["next"])
+        self.assertEqual([event["seq"] for event in second["events"]], list(range(100, 140)))
+        self.assertEqual(second["events"][19]["type"], "resumed")
+
+    def test_plain_log_survives_truncated_archive(self):
+        job = self.run_job()
+        plain = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        plain.write_text(json.dumps({"seq": 0, "type": "committed"}) + "\n")
+        archive.write_bytes(b"\x1f\x8btruncated")
+        self.assertEqual(self.store.events(job["id"], 0)["events"], [{"seq": 0, "type": "committed"}])
+
+    def test_archive_fallback_when_plain_disappears_during_open(self):
+        job = self.run_job()
+        directory = self.store.root / "jobs"
+        plain = directory / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        event = {"seq": 0, "type": "archived"}
+        with gzip.open(archive, "wt", encoding="utf-8") as stream:
+            stream.write(json.dumps(event) + "\n")
+        plain.write_text(json.dumps({"seq": 0, "type": "plain"}) + "\n")
+        path_open = Path.open
+        def unlink_during_plain_open(path, *args, **kwargs):
+            if path == plain:
+                plain.unlink()
+            return path_open(path, *args, **kwargs)
+        with patch.object(Path, "open", unlink_during_plain_open):
+            self.assertEqual(self.store.events(job["id"], 0)["events"], [event])
+
+    def test_plain_unlink_after_open_preserves_committed_events(self):
+        job = self.run_job()
+        plain = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        event = {"seq": 0, "type": "committed"}
+        archive.write_bytes(b"\x1f\x8b")
+        plain.write_text(json.dumps(event) + "\n")
+        path_open = Path.open
+        def unlink_after_open(path, *args, **kwargs):
+            stream = path_open(path, *args, **kwargs)
+            if path == plain:
+                plain.unlink()
+            return stream
+        with patch.object(Path, "open", unlink_after_open):
+            self.assertEqual(self.store.events(job["id"], 0)["events"], [event])
+
+    def test_partial_archive_finishes_when_plain_open_loses_cutover_race(self):
+        job = self.run_job()
+        plain = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        event = {"seq": 0, "type": "committed"}
+        archive.write_bytes(b"\x1f\x8b")
+        plain.write_text(json.dumps(event) + "\n")
+        path_open = Path.open
+        def complete_cutover(path, *args, **kwargs):
+            if path == plain and plain.exists():
+                with gzip.open(archive, "wt", encoding="utf-8") as stream:
+                    stream.write(json.dumps(event) + "\n")
+                plain.unlink()
+            return path_open(path, *args, **kwargs)
+        with patch.object(Path, "open", complete_cutover):
+            self.assertEqual(self.store.events(job["id"], 0)["events"], [event])
 
 
     def test_deadline_is_once_per_live_job_and_never_cancels(self):

@@ -66,15 +66,20 @@ def alert_thresholds(free_gb, state):
             if free_gb < threshold and threshold not in state.get("sent", [])]
 
 
+def notify_disk_low(test=False):
+    message = "Disk alert test: dispatch is now blocked (test)" if test else "dispatch is now blocked"
+    return subprocess.run(["/usr/bin/osascript", "-e",
+        f'display notification "{message}" with title "OMP disk low"'],
+        capture_output=True, timeout=20)
+
+
 def watch(free_gb):
     path = DATA / "watch-state.json"
     state = load(path, {"sent": []})
     pending = alert_thresholds(free_gb, state)
     save(path, state)
     if free_gb < 25 and not state.get("notification25"):
-        result = subprocess.run(["/usr/bin/osascript", "-e",
-            'display notification "dispatch is now blocked" with title "OMP disk low"'],
-            capture_output=True, timeout=20)
+        result = notify_disk_low()
         if result.returncode == 0:
             state["notification25"] = True
             save(path, state)
@@ -94,24 +99,32 @@ def watch(free_gb):
     daily_sizes(free_gb)
 
 
-def daily_sizes(free_gb):
+def daily_sizes(free_gb, *, force=False):
     today = dt.date.today().isoformat()
     path = DATA / "daily-state.json"
-    if load(path, {}).get("date") == today:
+    if not force and load(path, {}).get("date") == today:
         return
     sizes = []
+    partial = []
     for folder in FOLDERS:
         try:
             result = subprocess.run(["/usr/bin/du", "-sk", str(folder)],
                                     capture_output=True, text=True, timeout=240)
-            kb = int(result.stdout.split()[0]) if result.returncode == 0 else None
+            kb = int(result.stdout.splitlines()[-1].split()[0])
+            if kb < 0:
+                raise ValueError("negative disk size")
+            if result.returncode != 0:
+                partial.append(str(folder))
         except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
             kb = None
         sizes.append((str(folder), None if kb is None else round(kb * 1024 / 1e9, 3)))
     sizes.sort(key=lambda row: -1 if row[1] is None else row[1], reverse=True)
+    entry = {"date": today, "free_gb": round(free_gb, 3), "folders_gb": dict(sizes),
+             "partial_folders": partial}
     with (DATA / "daily-sizes.log").open("a") as stream:
-        stream.write(json.dumps({"date": today, "free_gb": round(free_gb, 3), "folders_gb": dict(sizes)}) + "\n")
+        stream.write(json.dumps(entry) + "\n")
     save(path, {"date": today})
+    return entry
 
 
 def weekly(now=None):
@@ -138,7 +151,8 @@ def weekly(now=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["watch", "weekly"])
+    parser.add_argument("mode", choices=["watch", "weekly", "daily", "notification-test"])
+    parser.add_argument("--refresh", action="store_true", help="append a fresh daily measurement even if already logged")
     args = parser.parse_args()
     DATA.mkdir(parents=True, exist_ok=True)
     os.chmod(DATA, 0o700)
@@ -151,6 +165,15 @@ def main():
         try:
             if args.mode == "watch":
                 watch(shutil.disk_usage(HOME).free / 1e9)
+            elif args.mode == "daily":
+                entry = daily_sizes(shutil.disk_usage(HOME).free / 1e9, force=args.refresh)
+                if entry is not None:
+                    print(json.dumps(entry))
+            elif args.mode == "notification-test":
+                result = notify_disk_low(test=True)
+                print(json.dumps({"test": True, "notification_exit_code": result.returncode}))
+                if result.returncode:
+                    raise SystemExit(result.returncode)
             else:
                 weekly()
         except Exception as error:

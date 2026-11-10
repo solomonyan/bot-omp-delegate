@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Install local disk tools; reaper is always installed in dry-run mode."""
+"""Install local disk tools; live reaping requires explicit approval."""
+import argparse
 import os
 from pathlib import Path
 import plistlib
@@ -8,6 +9,9 @@ import subprocess
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--live-reaper", action="store_true", help="enable reviewed live deletion instead of dry-run")
+    args = parser.parse_args()
     source = Path(__file__).resolve().parent
     home = Path.home()
     target = home / "lanes/omp-runs/live/bin/disk"
@@ -26,7 +30,7 @@ def main():
     for name in ("__init__.py", "webhooks.py"):
         shutil.copy2(source.parents[1] / "bot_omp_delegate" / name, package / name)
     jobs = {
-        "com.solomon.mac-disk-reaper": (["mac_disk_reaper.py", "--dry-run"], {"StartInterval": 3600}),
+        "com.solomon.mac-disk-reaper": (["mac_disk_reaper.py", *([] if args.live_reaper else ["--dry-run"])], {"StartInterval": 3600}),
         "com.solomon.mac-disk-watch": (["mac_disk_ops.py", "watch"], {"StartInterval": 600}),
         # Daily scheduling is intentional: after an active-job skip, retry the
         # next day. weekly-state.json limits successful cleanup to once/7 days.

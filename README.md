@@ -168,13 +168,13 @@ Provider credentials stay with each operator's OMP installation. That is not a g
 ## Mac disk prevention
 
 `scripts/mac-disk/` contains local maintenance tools, independent of daemon
-deployment. Run `python3 scripts/mac-disk/install.py` on the operator's Mac to copy
-the scripts and an outbound-library snapshot to
-`~/lanes/omp-runs/live/bin/disk/` and install these user launchd agents:
+deployment. Run `python3 scripts/mac-disk/install.py` for safe dry-run installation,
+or add `--live-reaper` only after Lead approves the report. This copies the scripts
+and an outbound-library snapshot to `~/lanes/omp-runs/live/bin/disk/` and installs:
 
 | Label | Schedule | Mode |
 | --- | --- | --- |
-| `com.solomon.mac-disk-reaper` | Hourly | **`--dry-run`**, until Lead reviews output |
+| `com.solomon.mac-disk-reaper` | Hourly | Dry-run by default; **live after Lead approval** |
 | `com.solomon.mac-disk-watch` | Every 10 minutes | Live alerts and daily size log |
 | `com.solomon.mac-disk-weekly` | Daily 03:15 retry | Cleanup at most once per seven days |
 
@@ -193,7 +193,9 @@ only after review and coordinate cleanup with lane dispatch.
 Runtime output is private under `~/lanes/omp-runs/disk-prevention/`:
 append-only `reaper.log`, daily `daily-sizes.log`, alert latches in
 `watch-state.json`, and cleanup completion in `weekly-state.json`.
-Unmeasurable folder totals are recorded as `null`, not treated as zero.
+Partial `du` totals are retained and identified in `partial_folders`; only missing
+or invalid measurements become `null`. `mac_disk_ops.py daily --refresh` appends
+an explicitly requested fresh measurement without rewriting earlier log lines.
 Watch alerts latch independently below 50GB and 25GB, and re-arm only above
 60GB. The 25GB alert also displays “dispatch is now blocked” through macOS
 notifications. Failed webhook delivery retries on the next tick.
@@ -201,6 +203,11 @@ notifications. Failed webhook delivery retries on the next tick.
 own configured outbound transport, authentication, redaction and signing code;
 no secrets are printed or copied into scripts. This explicitly targeted local
 operator alert does not change subscriber configuration or restart the daemon.
+`mac_disk_ops.py notification-test` posts one clearly labeled test notification
+using the normal notification path. `disk_emit.py --test --threshold-gb 25
+--free-gb CURRENT` sends one test-marked `disk.low` HTTP attempt, even above the
+threshold, and returns its status and `request_id` (`X-OMP-Delivery`). Neither
+test command changes `watch-state.json`.
 
 Weekly cleanup runs `brew cleanup -s` then `pnpm store prune`, checking for active
 or unknown job state before each command. An active job skips cleanup until the

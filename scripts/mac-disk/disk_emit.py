@@ -22,12 +22,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Emit a signed disk.low event to the configured disk subscriber.")
     parser.add_argument("--threshold-gb", required=True, type=float)
     parser.add_argument("--free-gb", required=True, type=float)
+    parser.add_argument("--test", action="store_true", help="mark payload as a test and make exactly one HTTP attempt")
     args = parser.parse_args(argv)
 
     state = Path(os.environ.get("OMP_DELEGATE_STATE", "~/.omp-delegate")).expanduser()
-    dispatcher = WebhookDispatcher(state)
+    dispatcher = WebhookDispatcher(state, retry_delays=()) if args.test else WebhookDispatcher(state)
     try:
-        result = dispatcher.emit_disk_low(free_gb=args.free_gb, threshold_gb=args.threshold_gb)
+        result = dispatcher.emit_disk_low(free_gb=args.free_gb, threshold_gb=args.threshold_gb, test=args.test)
     except (ConfigError, OSError):
         print(json.dumps({"error": "disk.low delivery unavailable"}), file=sys.stderr)
         return 1

@@ -406,19 +406,22 @@ class WebhookDispatcher:
             # Delivery is never allowed to alter a lane's state or expose exceptions.
             self._dropped += 1
 
-    def emit_disk_low(self, *, free_gb, threshold_gb):
+    def emit_disk_low(self, *, free_gb, threshold_gb, test=False):
         for value, name in ((free_gb, "free_gb"), (threshold_gb, "threshold_gb")):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ConfigError(f"{name} must be a finite non-negative number")
-        if threshold_gb == 0 or free_gb >= threshold_gb:
+        if threshold_gb == 0 or (not test and free_gb >= threshold_gb):
             raise ConfigError("disk.low requires free_gb below a positive threshold_gb")
         payload = {
-            "event": "disk.low", "lane": "", "lane_id": "", "job_id": "", "status": "low",
+            "event": "disk.low", "lane": "", "lane_id": "", "job_id": "", "status": "test" if test else "low",
             "cwd": "", "branch": "", "last_commit_sha": "",
-            "summary": f"Disk space low: {free_gb:g} GB free (threshold {threshold_gb:g} GB)",
+            "summary": (f"Disk alert test: {free_gb:g} GB free (test)" if test else
+                        f"Disk space low: {free_gb:g} GB free (threshold {threshold_gb:g} GB)"),
             "free_gb": free_gb, "threshold_gb": threshold_gb,
             "ts": datetime.now(timezone.utc).isoformat(), "event_id": f"disk.low:{uuid.uuid4()}",
         }
+        if test:
+            payload["test"] = True
         envelope, subscribers = self._prepare(payload, bypass_filters=True)
         target = next((s for s in subscribers if s["id"] == "jarvis-omp-events"), None)
         if target is None:
@@ -453,7 +456,8 @@ class WebhookDispatcher:
             if attempt < len(self.retry_delays) and self._stop.wait(self.retry_delays[attempt]):
                 error = "stopped"
                 break
-        return {"subscriber_id": subscriber["id"], "delivered": success, "status_code": status, "attempts": attempts, "error": None if success else error}
+        return {"subscriber_id": subscriber["id"], "delivered": success, "status_code": status,
+                "request_id": delivery_id, "attempts": attempts, "error": None if success else error}
 
     def _worker(self):
         while not self._stop.is_set():

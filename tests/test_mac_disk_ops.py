@@ -10,6 +10,25 @@ SPEC.loader.exec_module(ops)
 
 
 class DiskOpsTests(unittest.TestCase):
+    def test_daily_sizes_retains_partial_total_and_reports_missing_measurements(self):
+        import json
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            measured, unavailable = Path("/private/tmp"), Path("/unavailable")
+            results = [
+                subprocess.CompletedProcess([], 1, "2000000\t/private/tmp\n", "permission denied"),
+                subprocess.CompletedProcess([], 1, "", "permission denied"),
+            ]
+            with patch.object(ops, "DATA", root), patch.object(ops, "FOLDERS", [measured, unavailable]), \
+                 patch.object(ops.subprocess, "run", side_effect=results):
+                ops.daily_sizes(100)
+            entry = json.loads((root / "daily-sizes.log").read_text())
+            self.assertEqual(entry["folders_gb"][str(measured)], 2.048)
+            self.assertIsNone(entry["folders_gb"][str(unavailable)])
+            self.assertEqual(entry["partial_folders"], [str(measured)])
+
     def test_thresholds_latch_independently_until_above_sixty(self):
         state = {"sent": []}
         self.assertEqual(ops.alert_thresholds(49, state), [50])

@@ -376,6 +376,45 @@ class MacDiskReaperSafetyTests(unittest.TestCase):
                 sum(row.get("reason") == "active_job_or_lane_overlap" for row in rows), 2,
             )
 
+    def test_bare_repository_with_unpublished_ref_is_kept(self):
+        import contextlib
+        import io
+        import subprocess
+        import time
+
+        temp_root = "/private/tmp" if Path("/private/tmp").is_dir() else None
+        with tempfile.TemporaryDirectory(prefix="verify-omp6-bare-", dir=temp_root) as directory:
+            candidate = Path(directory).resolve()
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+            def git(*args, input=None):
+                return subprocess.run(
+                    ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture",
+                     "-c", "user.email=fixture@example.invalid", "-C", str(candidate), *args],
+                    input=input, check=True, capture_output=True, text=True, env=env,
+                )
+
+            git("init", "--bare")
+            tree = git("mktree", input="").stdout.strip()
+            commit = git("commit-tree", tree, "-m", "only unpublished copy").stdout.strip()
+            git("update-ref", "refs/heads/only-copy", commit)
+            git("symbolic-ref", "HEAD", "refs/heads/only-copy")
+            old = time.time() - 2 * reaper.DAY
+            os.utime(candidate, (old, old))
+            rows = []
+            with patch.object(reaper, "discover_candidates", return_value=[candidate]), \
+                 patch.object(reaper, "_guard_paths", return_value=[]), \
+                 patch.object(reaper, "_cleanup_old_logs", return_value=(0, 0, [])), \
+                 patch.object(reaper, "_chrome_processes", return_value=[]), \
+                 patch.object(reaper, "_snapshot_report", return_value=0), \
+                 patch.object(reaper, "_record", side_effect=rows.append), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                reaper._run_once(True)
+            decisions = [row for row in rows if row.get("path") == str(candidate)]
+            self.assertEqual([(row["action"], row.get("reason")) for row in decisions],
+                             [("kept", "git_unpublished_refs")])
+            self.assertEqual(git("rev-parse", "refs/heads/only-copy").stdout.strip(), commit)
+
     def test_dry_run_never_removes_candidate(self):
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "candidate"

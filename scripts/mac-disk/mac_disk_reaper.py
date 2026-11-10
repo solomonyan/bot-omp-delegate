@@ -327,6 +327,16 @@ def _git_root(candidate: Path) -> Path | None:
 
 
 def _git_kind(candidate: Path) -> str | None:
+    # Bare repositories have no .git entry and --show-toplevel rejects them.
+    # Classify them before the non-Git temporary-directory removal path.
+    try:
+        bare = _run(["git", "-C", str(candidate), "rev-parse", "--is-bare-repository"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SafetyError("git inspection failed") from exc
+    if bare.returncode == 0 and bare.stdout.strip() == "true":
+        return "bare"
+    if bare.returncode and (candidate / "HEAD").exists() and (candidate / "objects").is_dir():
+        raise SafetyError("bare git metadata cannot be inspected")
     root = _git_root(candidate)
     if root is None:
         return None

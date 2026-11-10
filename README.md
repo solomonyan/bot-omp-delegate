@@ -183,6 +183,8 @@ Unproven ownership, active/unknown job state, dirty/untracked files, unpushed
 commits or refs, any common-repository stash, missing upstreams, protected paths
 and `ANSWER*.md` prevent removal. Shared stashes and tags are inspected for
 linked worktrees too; tag/ref-only commits must be reachable from remote refs.
+Bare repositories are identified before the non-Git cleanup path and receive the
+same stash/tag/ref checks; missing worktree/upstream evidence retains them.
 Git worktrees use `git worktree remove` followed by prune, never forced removal.
 Changed orphans are retained, not silently discarded. Chrome processes without
 provable ended-run ownership are retained; no process-name kill is used.

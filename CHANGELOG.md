@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Detect bare Git repositories before non-Git temporary-directory cleanup and apply the existing stash/tag/unpublished-ref retention gates. Malformed bare metadata fails closed. A real-Git reaper regression preserves the only unpublished commit and records `kept/git_unpublished_refs`. The installed reaper remains dry-run; the disclosed dispatch/deletion window is unchanged.
+- Bare-repository acceptance: all 126 repository tests passed. Updated installed reaper source only; its plist remained byte-identical and loaded launchd remained hourly `--dry-run`. No live cleanup, agent reload or daemon change.
 - Verification fixes: retain shared stashes and unpublished tag/ref commits; tolerate gzip cutover races and merge resumed archive/plain event streams with sequence deduplication and bounded pages; purge compressed conversation logs.
 - Restrict installed lane log compression to known terminal jobs, with a pre-change backup and shipped diff. Preserve the 25GB floor, 5GB warning and 15GB interrupt. The reaper is restored to hourly `--dry-run`; ownership checks move to the removal boundary, but the final dispatch-to-filesystem race remains explicitly non-atomic.
 - Verification-fix acceptance: all 125 repository tests passed, including real-Git stash/tag/ref retention, sibling-worktree shared refs, late active-job exclusion, gzip cutover/partial archive reads, resumed-log pagination/deduplication and compressed purge. Installed reaper source updated without changing its plist; loaded launchd remains hourly `--dry-run`. The lane gzip loop smoke and both patch applicability checks passed; the production daemon was not changed.

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Bound job event logs by omitting cumulative streaming snapshots at persistence while preserving final messages, tool results, questions and lifecycle events; read archived gzip event logs.
+- Add conservative Mac disk maintenance with a dry-run hourly reaper, latched 50GB/25GB outbound alerts, daily size measurements and idle-only weekly package cleanup. Installation never deploys or restarts the daemon.
+- Disk-prevention verification: all 114 repository tests pass, including growing multi-subagent output, archived event reads, final-message/question/stall behavior, real Git worktree deletion and unpushed-branch preservation. Signed local watcher-to-emitter HTTP smoke verifies independent threshold latches and rearming; the macOS notification request was stubbed. Installed reaper remains dry-run; the production daemon and live lane guards were not changed.
 - Add a versioned `omp-dispatch` ticket wrapper that preserves session approval settings instead of reconfiguring permissions before every job. Keep machine-specific subscriber discovery and monitoring in private local adapters.
 - Route conversational notifications (`run.done`, `run.error`, `run.needs_input`) only to the recorded coordinator subscriber; add conversation/monitor modes, full response/input payloads, stable event identity, and event-based receiver deduplication guidance. Operational events remain monitor-only.
 - Grok's conversational workflow uses one detached job and its owner-routed webhook; questions use the existing answer path, and follow-up continues in the same session. OMP approval configuration is inherited unless an explicit mode is selected.

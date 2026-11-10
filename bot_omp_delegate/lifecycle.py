@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,17 @@ from .notifications import Notifications
 TERMINAL = {"completed", "aborted", "error", "interrupted"}
 INPUT_METHODS = {"select", "confirm", "input", "editor", "ask"}
 STATE_VERSION = 1
+
+
+def _transient_event(frame):
+    kind = frame.get("type")
+    if kind in {"message_update", "tool_execution_update"}:
+        return True
+    if kind == "subagent_event":
+        payload = frame.get("payload")
+        event = payload.get("event") if isinstance(payload, dict) else None
+        return isinstance(event, dict) and _transient_event(event)
+    return False
 
 
 class Conflict(ValueError):
@@ -446,6 +458,9 @@ class Store:
                 return
             if self.notifications.has_output(frame):
                 self.notifications.output(job)
+            if _transient_event(frame):
+                self.cv.notify_all()
+                return
             event = dict(frame, seq=job["nextSeq"])
             job["nextSeq"] += 1
             path = self.root / "jobs" / f"{jid}.jsonl"
@@ -901,10 +916,15 @@ class Store:
             raise ValueError("after must be a non-negative integer")
         with self.cv:
             self.job(jid)
-            path = self.root / "jobs" / f"{jid}.jsonl"
+            directory = self.root / "jobs"
             result = []
+            plain = directory / f"{jid}.jsonl"
+            # gzip retains the source until the archive is complete. Prefer it
+            # while both exist rather than opening a partially written archive.
+            path = plain if plain.exists() else directory / f"{jid}.jsonl.gz"
             if path.exists():
-                with path.open(encoding="utf-8") as stream:
+                opener = gzip.open if path.suffix == ".gz" else open
+                with opener(path, "rt", encoding="utf-8") as stream:
                     for line in stream:
                         event = json.loads(line)
                         if event["seq"] >= after:

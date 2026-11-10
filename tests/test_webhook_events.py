@@ -136,6 +136,64 @@ class EventTests(unittest.TestCase):
         self.now += 1700
         self.store.monitor_tick()
         self.assertEqual(self.names(), ["run.stalled"])
+    def test_transient_delta_persistence_is_bounded_and_final_events_keep_sequences(self):
+        import gzip
+        import json
+
+        job = self.run_job()
+        self.now = 123
+        delta = "x" * 256
+        children = ("child-a", "child-b", "child-c")
+        for index in range(200):
+            content = [{"type": "text", "text": delta * (index + 1)}]
+            message = {"role": "assistant", "content": content}
+            update = {"type": "message_update", "message": message,
+                      "assistantMessageEvent": {"type": "text_delta", "delta": delta,
+                                                "partial": message}}
+            self.event(update)
+            self.event({"type": "tool_execution_update", "partialResult": {"content": content}})
+            for child in children:
+                self.event({"type": "subagent_event", "payload": {"id": child, "event": update}})
+                self.event({"type": "subagent_event", "payload": {"id": child, "event": {
+                    "type": "tool_execution_update", "partialResult": {"content": content},
+                }}})
+        final_text = delta * 200
+        self.assertEqual(self.store.notifications.runs[job["id"]]["last_output"], 123)
+        for child in children:
+            self.event({"type": "subagent_event", "payload": {"id": child, "event": {
+                "type": "message_end", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": final_text},
+                ]},
+            }}})
+        self.event({"type": "tool_execution_end", "result": {"content": [{"type": "text", "text": final_text}]}})
+        self.event({"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": final_text},
+        ]}})
+        self.event({"type": "extension_ui_request", "id": "input-1", "method": "confirm", "title": "Continue?"})
+
+        path = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        persisted_bytes = path.stat().st_size
+        self.assertLess(persisted_bytes, len(final_text.encode("utf-8")) * 5 * 1.1)
+        stored = self.store.events(job["id"], 0)
+        self.assertEqual([event["seq"] for event in stored["events"]], list(range(len(stored["events"]))))
+        self.assertEqual([event["type"] for event in stored["events"]], [
+            "subagent_event", "subagent_event", "subagent_event", "tool_execution_end", "message_end", "extension_ui_request",
+        ])
+        for event in stored["events"][:3]:
+            self.assertEqual(event["payload"]["event"]["message"]["content"][0]["text"], final_text)
+        self.assertEqual(stored["events"][3]["result"]["content"][0]["text"], final_text)
+        self.assertEqual(self.store.job(job["id"])["finalMessage"], final_text)
+        self.assertEqual(self.store.job(job["id"])["pendingInput"][0]["id"], "input-1")
+        self.assertEqual(self.store.notifications.runs[job["id"]]["last_output"], 123)
+
+        compressed = path.with_suffix(".jsonl.gz")
+        compressed.write_bytes(b"\x1f\x8b")
+        self.assertEqual(self.store.events(job["id"], 0), stored)
+        with path.open("rb") as source, gzip.open(compressed, "wb") as target:
+            target.write(source.read())
+        path.unlink()
+        self.assertEqual(self.store.events(job["id"], 1)["events"], stored["events"][1:])
+
 
     def test_deadline_is_once_per_live_job_and_never_cancels(self):
         job = self.run_job("OPS-9")

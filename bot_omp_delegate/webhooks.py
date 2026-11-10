@@ -22,7 +22,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-EVENTS = frozenset({"run.done", "run.error", "run.deadline", "run.needs_input", "run.stalled", "lane.idle", "daemon.up"})
+EVENTS = frozenset({"run.done", "run.error", "run.deadline", "run.needs_input", "run.stalled", "lane.idle", "daemon.up", "disk.low"})
 _SUBSCRIBER_FIELDS = {"id", "url", "auth_header", "auth_value", "events", "lanes", "hmac_secret", "signature_header", "mode"}
 _HEADER = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -406,6 +406,25 @@ class WebhookDispatcher:
             # Delivery is never allowed to alter a lane's state or expose exceptions.
             self._dropped += 1
 
+    def emit_disk_low(self, *, free_gb, threshold_gb):
+        for value, name in ((free_gb, "free_gb"), (threshold_gb, "threshold_gb")):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ConfigError(f"{name} must be a finite non-negative number")
+        if threshold_gb == 0 or free_gb >= threshold_gb:
+            raise ConfigError("disk.low requires free_gb below a positive threshold_gb")
+        payload = {
+            "event": "disk.low", "lane": "", "lane_id": "", "job_id": "", "status": "low",
+            "cwd": "", "branch": "", "last_commit_sha": "",
+            "summary": f"Disk space low: {free_gb:g} GB free (threshold {threshold_gb:g} GB)",
+            "free_gb": free_gb, "threshold_gb": threshold_gb,
+            "ts": datetime.now(timezone.utc).isoformat(), "event_id": f"disk.low:{uuid.uuid4()}",
+        }
+        envelope, subscribers = self._prepare(payload, bypass_filters=True)
+        target = next((s for s in subscribers if s["id"] == "jarvis-omp-events"), None)
+        if target is None:
+            raise ConfigError("Required disk.low webhook subscriber is not configured")
+        result = self._deliver(envelope, target)
+        return {"configured": 1, "delivered": int(result["delivered"]), "results": [result]}
     def test(self, event="daemon.up"):
         if not isinstance(event, str) or event not in EVENTS:
             raise ConfigError("Unknown webhook event")

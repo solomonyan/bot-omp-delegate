@@ -35,6 +35,16 @@ omp-delegate daemon status
 
 Keep this directory in place; add the absolute `scripts` directory to your shell PATH for later use. In a supervisor, run `omp-delegate serve` in the foreground instead of `daemon start`. The detached daemon survives its launching shell, not a reboot. There is no automatic job replay or watchdog restart.
 
+Optional ticket-file dispatch uses `omp-dispatch LANE_ID /path/to/ticket.txt [max-hours]`.
+The ticket must contain a non-empty `Must-have:` line. Set
+`OMP_COORDINATOR_SUBSCRIBER_ID` to the job's webhook owner; `--caller NAME` adds
+a caller label, and `--dry-run` previews the detached submission without dispatching.
+The wrapper uses the sibling `omp-delegate` executable and preserves the session's
+approval policy, including explicit `yolo`/`write` or inherited OMP defaults.
+Change that policy with `omp-delegate session configure SESSION_ID --approval-mode yolo`
+only when intended and the session is idle. Subscriber discovery and local monitoring
+belong in private adapters, not this shared dispatcher.
+
 ## Use with an existing project
 
 Grok provides the task; the delegate starts the installed OMP client in the target project's working directory. The Grok Mac app alone does not establish that it can execute local commands: use an executor with the CLI installed and access to the daemon, OMP, and project files. OMP loads its own global setup and project instructions, performs the work, and returns questions or results.

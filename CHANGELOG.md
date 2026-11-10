@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a versioned `omp-dispatch` ticket wrapper that preserves session approval settings instead of reconfiguring permissions before every job. Keep machine-specific subscriber discovery and monitoring in private local adapters.
 - Route conversational notifications (`run.done`, `run.error`, `run.needs_input`) only to the recorded coordinator subscriber; add conversation/monitor modes, full response/input payloads, stable event identity, and event-based receiver deduplication guidance. Operational events remain monitor-only.
 - Grok's conversational workflow uses one detached job and its owner-routed webhook; questions use the existing answer path, and follow-up continues in the same session. OMP approval configuration is inherited unless an explicit mode is selected.
 - Conversation verification: 53 targeted delegate tests and 13 receiver tests passed. Installed OMP 18.18.2 with a loopback deterministic model verified inherited auto policy with zero approval webhooks, caller question/answer continuation in the same session, full final replies, and preserved explicit `write` approval. A sender/receiver/loopback-bot retry smoke produced two HTTP attempts with one forwarded question. The idle production daemon and local receiver were restarted; existing Grok subscribers now exclude operational events, and the payment lane retains `write`. External Grok endpoint delivery was not exercised.

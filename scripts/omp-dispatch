@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# omp-dispatch [--dry-run] [--caller NAME] <LANE_ID> <prompt-file> [max-hours=4]
+# Refuses tickets without a "Must-have:" line, then dispatches via omp-delegate.
+set -euo pipefail
+DRY=0
+CALLER="${OMP_CALLER:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY=1; shift ;;
+    --caller)
+      [[ $# -ge 2 ]] || { echo "usage: omp-dispatch [--dry-run] [--caller NAME] <LANE_ID> <prompt-file> [max-hours]" >&2; exit 2; }
+      CALLER="$2"; shift 2 ;;
+    --caller=*) CALLER="${1#--caller=}"; shift ;;
+    -*) echo "usage: omp-dispatch [--dry-run] [--caller NAME] <LANE_ID> <prompt-file> [max-hours]" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[[ $# -ge 2 ]] || { echo "usage: omp-dispatch [--dry-run] [--caller NAME] <LANE_ID> <prompt-file> [max-hours]" >&2; exit 2; }
+LANE="$1"; FILE="$2"; HOURS="${3:-4}"
+OMP="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/omp-delegate"
+[[ -f "$FILE" ]] || { echo "REFUSED: no such file $FILE" >&2; exit 3; }
+[[ "$HOURS" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "REFUSED: bad max-hours" >&2; exit 2; }
+if ! grep -Eq '^[[:space:]]*Must-have:[[:space:]]*[^[:space:]]' "$FILE"; then
+  echo "REFUSED: $FILE has no non-empty 'Must-have:' line" >&2; exit 4; fi
+
+EXTRA=()
+COORD="${OMP_COORDINATOR_SUBSCRIBER_ID:-}"
+if [[ -n "$COORD" ]]; then
+  EXTRA+=(--coordinator-subscriber-id "$COORD")
+fi
+if [[ -n "$CALLER" ]]; then
+  EXTRA+=(--label "omp-caller:${CALLER}")
+fi
+
+if [[ $DRY -eq 1 ]]; then
+  printf 'DRY-RUN: %q lane run %q "$(cat %q)" --max-hours %q --detach' "$OMP" "$LANE" "$FILE" "$HOURS"
+  if [[ ${#EXTRA[@]} -gt 0 ]]; then
+    printf ' %q' "${EXTRA[@]}"
+  fi
+  printf '\n'
+  exit 0
+fi
+# Preserve the session's configured approval policy; dispatch must not change permissions.
+if [[ ${#EXTRA[@]} -gt 0 ]]; then
+  "$OMP" lane run "$LANE" "$(cat "$FILE")" --max-hours "$HOURS" --detach "${EXTRA[@]}"
+else
+  "$OMP" lane run "$LANE" "$(cat "$FILE")" --max-hours "$HOURS" --detach
+fi

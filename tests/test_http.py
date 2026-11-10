@@ -92,6 +92,36 @@ class HttpLifecycleTests(unittest.TestCase):
         self.assertEqual(self.command("lane", "show", lane["id"])["sessionId"], current["sessionId"])
         self.assertEqual(self.command("session", "show", current["sessionId"])["availability"], "available")
 
+    def test_dispatch_wrapper_preserves_session_approval_policy(self):
+        from unittest.mock import patch
+        script = Path(__file__).resolve().parents[1] / "scripts" / "omp-dispatch"
+        ticket = self.root / "ticket.txt"
+        ticket.write_text("Must-have: Keep the existing session approval policy.\n")
+        for mode in ("yolo", "write", None):
+            with self.subTest(approval_mode=mode):
+                name = mode or "inherited"
+                project = self.root / name
+                project.mkdir()
+                options = {} if mode is None else {"approval_mode": mode}
+                lane = self.client.request("POST", "/lanes", {
+                    "name": name, "cwd": str(project), "options": options,
+                })
+                with patch.object(self.store, "_run"):
+                    result = subprocess.run(
+                        [str(script), lane["id"], str(ticket)],
+                        cwd=self.root,
+                        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
+                                 OMP_DELEGATE_STATE=str(self.state),
+                                 OMP_DELEGATE_PORT=str(self.server.server_port),
+                                 OMP_COORDINATOR_SUBSCRIBER_ID="", OMP_CALLER=""),
+                        text=True, capture_output=True, timeout=15,
+                    )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                job = self.client.request("GET", f'/jobs/{json.loads(result.stdout)["id"]}')
+                self.assertEqual(job["sessionId"], lane["sessionId"])
+                session = self.client.request("GET", f'/sessions/{lane["sessionId"]}')
+                self.assertEqual(session["options"], options)
+
     def test_wait_preserves_terminal_provider_error_over_http(self):
         from unittest.mock import patch
         session = self.store.create({"name": "waiting", "cwd": str(self.project)})

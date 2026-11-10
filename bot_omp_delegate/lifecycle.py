@@ -23,7 +23,7 @@ STATE_VERSION = 1
 
 def _transient_event(frame):
     kind = frame.get("type")
-    if kind in {"message_update", "tool_execution_update"}:
+    if kind in {"message_update", "tool_execution_update", "tool_stream_update", "subagent_progress"}:
         return True
     if kind == "subagent_event":
         payload = frame.get("payload")

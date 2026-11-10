@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Omit `tool_stream_update` and `subagent_progress` from persisted events, at the top level and recursively inside `subagent_event`. Preserve tool results, child final/completion events, caller questions and gapless persisted sequence numbers. Stall detection still observes actual tool output in memory before filtering; progress-only metadata does not reset output inactivity.
+- Streaming follow-up verification: all 128 repository tests passed, including top-level/nested progress suppression, retained final results and questions, contiguous persisted sequences, and in-memory stall detection/re-arming. No daemon or installed runtime files were changed.
 - Detect bare Git repositories before non-Git temporary-directory cleanup and apply the existing stash/tag/unpublished-ref retention gates. Malformed bare metadata fails closed. A real-Git reaper regression preserves the only unpublished commit and records `kept/git_unpublished_refs`. The installed reaper remains dry-run; the disclosed dispatch/deletion window is unchanged.
 - Bare-repository acceptance: all 126 repository tests passed. Updated installed reaper source only; its plist remained byte-identical and loaded launchd remained hourly `--dry-run`. No live cleanup, agent reload or daemon change.
 - Verification fixes: retain shared stashes and unpublished tag/ref commits; tolerate gzip cutover races and merge resumed archive/plain event streams with sequence deduplication and bounded pages; purge compressed conversation logs.

@@ -138,6 +138,76 @@ class EventTests(unittest.TestCase):
         self.now += 1700
         self.store.monitor_tick()
         self.assertEqual(self.names(), ["run.stalled"])
+    def test_stream_and_progress_are_dropped_while_final_results_and_questions_survive(self):
+        job = self.run_job()
+        started = {"type": "subagent_lifecycle", "payload": {"id": "child", "status": "started"}}
+        self.event(started)
+        for kind in ("tool_stream_update", "subagent_progress"):
+            frame = {"type": kind, "text": "streaming progress"}
+            self.event(frame)
+            self.event({"type": "subagent_event", "payload": {"id": "child", "event": frame}})
+            self.event({"type": "subagent_event", "payload": {"id": "child", "event": {
+                "type": "subagent_event", "payload": {"id": "grandchild", "event": frame},
+            }}})
+        finals = [
+            {"type": "tool_execution_end", "result": {"content": [{"type": "text", "text": "tool result"}]}},
+            {"type": "subagent_event", "payload": {"id": "child", "event": {
+                "type": "tool_execution_end", "result": {"content": [{"type": "text", "text": "child tool result"}]},
+            }}},
+            {"type": "subagent_event", "payload": {"id": "child", "event": {
+                "type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "child final"}]},
+            }}},
+            {"type": "subagent_lifecycle", "payload": {"id": "child", "status": "completed"}},
+            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "parent final"}]}},
+        ]
+        for frame in finals:
+            self.event(frame)
+        question = {"type": "extension_ui_request", "id": "approval", "method": "confirm", "title": "Continue?"}
+        self.event(question)
+        self.assertEqual(self.store.job(job["id"])["pendingInput"], [question])
+        self.assertEqual(self.sink.events[-1]["input"], question)
+        cancel = {"type": "extension_ui_request", "method": "cancel", "targetId": "approval"}
+        completed = {"type": "prompt_result", "id": job["id"], "status": "completed", "sessionSettled": True}
+        self.event(cancel)
+        self.event(completed)
+        expected = [dict(frame, seq=seq) for seq, frame in enumerate([started, *finals, question, cancel, completed])]
+        path = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], expected)
+        self.assertEqual(self.store.events(job["id"], 0)["events"], expected)
+        self.assertEqual(self.store.job(job["id"])["finalMessage"], "parent final")
+        self.assertEqual(self.store.job(job["id"])["pendingInput"], [])
+        self.assertEqual(self.store.job(job["id"])["status"], "completed")
+        self.assertEqual(self.names(), ["run.needs_input", "run.done"])
+        self.assertEqual(self.sink.events[-1]["message"], "parent final")
+
+    def test_dropped_tool_streams_update_in_memory_stalls_but_progress_does_not_mask_silence(self):
+        job = self.run_job()
+        self.now = 1700
+        self.event({"type": "tool_stream_update", "text": "tool output"})
+        self.now = 3499
+        progress = {"type": "subagent_progress", "text": "status only"}
+        self.event(progress)
+        self.event({"type": "subagent_event", "payload": {"id": "child", "event": progress}})
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), [])
+        self.now = 3500
+        self.store.monitor_tick()
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), ["run.stalled"])
+        self.now = 3600
+        self.event({"type": "subagent_event", "payload": {"id": "child", "event": {
+            "type": "tool_stream_update", "delta": "child tool output",
+        }}})
+        self.now = 5399
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), ["run.stalled"])
+        self.now = 5400
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), ["run.stalled", "run.stalled"])
+        self.assertEqual(self.store.events(job["id"], 0), {"events": [], "next": 0})
+        self.assertEqual(self.store.job(job["id"])["nextSeq"], 0)
+        self.assertFalse((self.store.root / "jobs" / f"{job['id']}.jsonl").exists())
+
     def test_transient_delta_persistence_is_bounded_and_final_events_keep_sequences(self):
         import gzip
         import json

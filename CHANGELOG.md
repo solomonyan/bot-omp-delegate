@@ -2,7 +2,10 @@
 
 ## Unreleased
 
-- Hold `run.needs_input` for tool-approval prompts (`select` titled `Allow tool: ...` with an approve option) whose session cwd is under `needs_input_grace_roots` (default `~/lanes/omp-runs/design/launch-2026-11-11/`) for `needs_input_grace_seconds` (default 30). Drop it if the prompt is answered, cancelled or the job ends first; otherwise forward it once, unchanged. Real questions, other roots and every other event stay immediate. `0` (or `OMP_DELEGATE_NEEDS_INPUT_GRACE_SECONDS=0`) restores immediate delivery; shutdown forwards anything still held.
+- Hold every `run.needs_input` for `needs_input_grace_seconds` (default 30). Log it locally if the prompt is answered, cancelled or the job ends first; otherwise forward it once, unchanged. `0` (or `OMP_DELEGATE_NEEDS_INPUT_GRACE_SECONDS=0`) restores immediate delivery; shutdown forwards anything still held.
+- Post only `run.done`, `run.error`, `run.needs_input` and `run.stalled`. Everything else (`run.deadline`, `lane.idle`, `daemon.up`, unrouted events, prompts resolved within the grace, pre-approved prompts) goes to the private size-capped `<state-dir>/logs/events-filtered.jsonl`.
+- Route each event by its job label through the optional `caller_routes` label-to-subscriber map; unmapped labels keep the recorded coordinator subscriber.
+- Answer `Allow tool: browser` prompts in sessions under `~/lanes/omp-runs/design/` with the one-time approve option (`tool_preapprovals`), so design sessions never wake anyone for browser use.
 - Add a versioned `omp-dispatch` ticket wrapper that preserves session approval settings instead of reconfiguring permissions before every job. Keep machine-specific subscriber discovery and monitoring in private local adapters.
 - Route conversational notifications (`run.done`, `run.error`, `run.needs_input`) only to the recorded coordinator subscriber; add conversation/monitor modes, full response/input payloads, stable event identity, and event-based receiver deduplication guidance. Operational events remain monitor-only.
 - Grok's conversational workflow uses one detached job and its owner-routed webhook; questions use the existing answer path, and follow-up continues in the same session. OMP approval configuration is inherited unless an explicit mode is selected.

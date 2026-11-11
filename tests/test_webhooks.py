@@ -130,7 +130,7 @@ class WebhookTests(unittest.TestCase):
         Receiver.delay = .3
         dispatcher = WebhookDispatcher(self.root, retry_delays=(), request_timeout=1)
         started = time.monotonic()
-        dispatcher.emit({"event": "daemon.up", "summary": self.url})
+        dispatcher.emit({"event": "run.stalled", "summary": self.url})
         self.assertLess(time.monotonic() - started, .1)
         receipt = dispatcher.test()
         self.assertEqual(receipt["delivered"], 1)
@@ -139,16 +139,16 @@ class WebhookTests(unittest.TestCase):
 
     def test_event_and_lane_filters_match_name_or_id(self):
         add_subscriber(self.root, self.subscriber(events=["run.stalled"], lanes=["coding"]))
-        add_subscriber(self.root, self.subscriber(id="by-id", events=["lane.idle"], lanes=["lane-42"]))
+        add_subscriber(self.root, self.subscriber(id="by-id", events=["run.stalled"], lanes=["lane-42"]))
         dispatcher = WebhookDispatcher(self.root, retry_delays=())
         self.addCleanup(dispatcher.close)
         dispatcher.emit({"event": "run.stalled", "lane": "other", "lane_id": "other"})
         dispatcher.emit({"event": "lane.idle", "lane": "coding", "lane_id": "other"})
         dispatcher.emit({"event": "run.stalled", "lane": "coding", "lane_id": "other"})
-        dispatcher.emit({"event": "lane.idle", "lane": "other", "lane_id": "lane-42"})
+        dispatcher.emit({"event": "run.stalled", "lane": "other", "lane_id": "lane-42"})
         dispatcher._queue.join()
         self.assertCountEqual([(json.loads(body)["event"], json.loads(body)["lane_id"]) for body, _ in Receiver.received],
-                              [("run.stalled", "other"), ("lane.idle", "lane-42")])
+                              [("run.stalled", "other"), ("run.stalled", "lane-42")])
 
     def test_mode_defaults_to_monitor_and_rejects_unknown_values(self):
         add_subscriber(self.root, self.subscriber())
@@ -186,6 +186,85 @@ class WebhookTests(unittest.TestCase):
         dispatcher._queue.join()
         self.assertEqual([json.loads(body)["event"] for body, _ in Receiver.received],
                          ["run.stalled"])
+
+    def with_config(self, **keys):
+        path = self.root / "webhooks.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), **keys}))
+        os.chmod(path, 0o600)
+
+    def filtered(self):
+        path = self.root / "logs" / "events-filtered.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_label_routes_to_mapped_owner_and_unmapped_label_falls_back_to_coordinator(self):
+        add_subscriber(self.root, self.subscriber(id="jarvis-omp-events", url=self.url.replace("/hook", "/jarvis"), mode="conversation"))
+        add_subscriber(self.root, self.subscriber(id="friday-omp-events", url=self.url.replace("/hook", "/friday"), mode="conversation"))
+        self.with_config(caller_routes={"omp-caller:friday": "friday-omp-events", "omp-caller:gone": "removed-subscriber"})
+        dispatcher = WebhookDispatcher(self.root, retry_delays=())
+        self.addCleanup(dispatcher.close)
+        for label in ("omp-caller:friday", "omp-caller:karen", "omp-caller:gone"):
+            dispatcher.emit({"event": "run.done", "label": label, "summary": label}, coordinator_subscriber_id="jarvis-omp-events")
+        dispatcher.emit({"event": "run.stalled", "label": "omp-caller:friday", "summary": "stalled"}, coordinator_subscriber_id="jarvis-omp-events")
+        dispatcher._queue.join()
+        routed = sorted((json.loads(body)["summary"], path) for (body, _), path in zip(Receiver.received, Receiver.paths))
+        self.assertEqual(routed, [("omp-caller:friday", "/friday"), ("omp-caller:gone", "/jarvis"),
+                                  ("omp-caller:karen", "/jarvis"), ("stalled", "/friday")])
+        self.assertEqual(list_config(self.root)["caller_routes"]["omp-caller:friday"], "friday-omp-events")
+
+    def test_only_allowlisted_events_post_and_the_rest_are_logged_locally(self):
+        add_subscriber(self.root, self.subscriber(mode="conversation", auth_header="X-Token", auth_value="synthetic-secret-value"))
+        add_subscriber(self.root, self.subscriber(id="observer", url=self.url.replace("/hook", "/observer")))
+        dispatcher = WebhookDispatcher(self.root, retry_delays=())
+        self.addCleanup(dispatcher.close)
+        for event in ("run.deadline", "lane.idle", "daemon.up", "disk.low"):
+            dispatcher.emit({"event": event, "job_id": "j1", "summary": "leak synthetic-secret-value"}, coordinator_subscriber_id="test")
+        dispatcher.emit({"event": "run.done", "job_id": "j2", "summary": "ownerless"})
+        for event in ("run.done", "run.error", "run.needs_input", "run.stalled"):
+            dispatcher.emit({"event": event, "job_id": "j3"}, coordinator_subscriber_id="test")
+        dispatcher._queue.join()
+        self.assertCountEqual([json.loads(body)["event"] for body, _ in Receiver.received],
+                              ["run.done", "run.error", "run.needs_input", "run.stalled", "run.stalled"])
+        logged = self.filtered()
+        self.assertEqual([(e["event"], e["reason"]) for e in logged],
+                         [("run.deadline", "not_allowlisted"), ("lane.idle", "not_allowlisted"), ("daemon.up", "not_allowlisted"),
+                          ("disk.low", "not_allowlisted"), ("run.done", "no_route")])
+        self.assertNotIn("synthetic-secret-value", (self.root / "logs" / "events-filtered.jsonl").read_text())
+        self.assertEqual((self.root / "logs" / "events-filtered.jsonl").stat().st_mode & 0o777, 0o600)
+
+    def test_filtered_log_is_size_capped(self):
+        add_subscriber(self.root, self.subscriber())
+        dispatcher = WebhookDispatcher(self.root, retry_delays=())
+        self.addCleanup(dispatcher.close)
+        with patch("bot_omp_delegate.webhooks.FILTERED_LOG_MAX_BYTES", 2000):
+            for index in range(100):
+                dispatcher.emit({"event": "lane.idle", "summary": f"idle {index} " + "x" * 50})
+        current = self.root / "logs" / "events-filtered.jsonl"
+        rotated = self.root / "logs" / "events-filtered.jsonl.1"
+        self.assertLess(current.stat().st_size, 2500)
+        self.assertLess(rotated.stat().st_size, 2500)
+        self.assertIn("idle 99 ", current.read_text())
+        self.assertEqual(Receiver.received, [])
+
+    def test_route_and_preapproval_config_is_validated(self):
+        add_subscriber(self.root, self.subscriber())
+        for keys, ok in (({"caller_routes": {"omp-caller:karen": "karen-omp-events"}}, True),
+                         ({"caller_routes": {"omp-caller:karen": "https://x.invalid/hook"}}, False),
+                         ({"caller_routes": ["omp-caller:karen"]}, False),
+                         ({"tool_preapprovals": [{"cwd_root": "~/design/", "tools": ["browser"]}]}, True),
+                         ({"tool_preapprovals": []}, True),
+                         ({"tool_preapprovals": [{"cwd_root": "relative/", "tools": ["browser"]}]}, False),
+                         ({"tool_preapprovals": [{"cwd_root": "/x", "tools": []}]}, False),
+                         ({"tool_preapprovals": [{"cwd_root": "/x", "tools": ["*"]}]}, False)):
+            self.with_config(**keys)
+            if ok:
+                load_config(self.root)
+            else:
+                with self.assertRaises(ConfigError, msg=keys):
+                    load_config(self.root)
+            path = self.root / "webhooks.json"
+            raw = json.loads(path.read_text())
+            raw.pop("caller_routes", None); raw.pop("tool_preapprovals", None)
+            path.write_text(json.dumps(raw)); os.chmod(path, 0o600)
 
     def test_redaction_precedes_summary_truncation_and_git_uses_event_worktree(self):
         secret = "synthetic-authentication-secret-crossing-the-summary-boundary"
@@ -243,7 +322,7 @@ class WebhookTests(unittest.TestCase):
         dispatcher = WebhookDispatcher(self.root, retry_delays=(.2, .2, .2), request_timeout=1)
         self.addCleanup(dispatcher.close)
         before = time.monotonic()
-        dispatcher.emit({"event": "daemon.up"})
+        dispatcher.emit({"event": "run.stalled"})
         self.assertLess(time.monotonic() - before, .2)
         self.assertTrue(Receiver.wake.wait(.5), "Healthy subscriber must not wait for another receiver's retries")
         dispatcher._queue.join()
@@ -260,9 +339,9 @@ class WebhookTests(unittest.TestCase):
             return True, 204, None
         try:
             with patch("bot_omp_delegate.webhooks._request", side_effect=slow_request):
-                dispatcher.emit({"event": "daemon.up"})
+                dispatcher.emit({"event": "run.stalled"})
                 self.assertTrue(entered.wait(1))
-                dispatcher.emit({"event": "daemon.up"})
+                dispatcher.emit({"event": "run.stalled"})
                 before = time.monotonic()
                 receipt = dispatcher.test()
                 self.assertLess(time.monotonic() - before, .2)
@@ -326,24 +405,24 @@ class WebhookTests(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         delivered = []
         def request(_subscriber, body, *_args):
-            event = json.loads(body)["event"]
-            if event == "daemon.up":
+            summary = json.loads(body)["summary"]
+            if summary == "first":
                 entered.set()
                 release.wait(2)
-            delivered.append(event)
+            delivered.append(summary)
             return True, 204, None
         try:
             with patch("bot_omp_delegate.webhooks._request", side_effect=request):
-                dispatcher.emit({"event": "daemon.up"})
+                dispatcher.emit({"event": "run.stalled", "summary": "first"})
                 self.assertTrue(entered.wait(1))
-                dispatcher.emit({"event": "run.stalled"})
+                dispatcher.emit({"event": "run.stalled", "summary": "second"})
                 timer = threading.Timer(.05, release.set)
                 timer.start()
                 before = time.monotonic()
                 dispatcher.close(drain_timeout=.5)
                 timer.join()
                 self.assertLess(time.monotonic() - before, 1.5)
-                self.assertEqual(delivered, ["daemon.up", "run.stalled"])
+                self.assertEqual(delivered, ["first", "second"])
         finally:
             release.set()
             dispatcher.close(drain_timeout=0)

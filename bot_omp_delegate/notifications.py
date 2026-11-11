@@ -9,6 +9,11 @@ import time
 TERMINAL = frozenset({"completed", "error", "aborted", "interrupted"})
 
 
+def _option_labels(request):
+    return [o if isinstance(o, str) else (o.get("label") or o.get("value") or "") if isinstance(o, dict) else ""
+            for o in request.get("options") or []]
+
+
 def is_tool_approval(request):
     """OMP's per-tool permission dialog: select titled "Allow tool: ..." with an approve option."""
     if not isinstance(request, dict) or request.get("method") != "select":
@@ -16,9 +21,14 @@ def is_tool_approval(request):
     title = request.get("title")
     if not isinstance(title, str) or not title.startswith("Allow tool:"):
         return False
-    labels = [o if isinstance(o, str) else (o.get("label") or o.get("value") or "") if isinstance(o, dict) else ""
-              for o in request.get("options") or []]
-    return any(isinstance(label, str) and label.lower().startswith(("approve", "allow")) for label in labels)
+    return any(isinstance(label, str) and label.lower().startswith(("approve", "allow")) for label in _option_labels(request))
+
+
+def one_time_approval(request):
+    """The approve option that grants this call only, never a session/directory-wide grant."""
+    return next((label for label in _option_labels(request) if isinstance(label, str)
+                 and label.lower().startswith(("approve", "allow"))
+                 and not any(word in label.lower() for word in ("session", "directory", "always"))), None)
 
 
 def under_roots(cwd, roots):
@@ -49,6 +59,25 @@ class Notifications:
     def emit(self, event, job=None, session=None, lane=None, summary=None, input_request=None):
         if not self.enabled:
             return
+        payload = self._payload(event, job, session, lane, summary, input_request)
+        try:
+            # Only bounded enqueue is allowed here: caller may hold Store.cv.
+            owner = (job or {}).get("coordinator_subscriber_id")
+            if owner is None:
+                self.dispatcher.emit(payload)
+            else:
+                self.dispatcher.emit(payload, coordinator_subscriber_id=owner)
+        except Exception:
+            # Notification failure must not change an agent's outcome. No exception
+            # text is logged because transports can embed secret endpoint values.
+            self.failures += 1
+
+    def _record(self, reason, job, session, lane, summary, request):
+        record = getattr(self.dispatcher, "record_filtered", None)
+        if record is not None:
+            record(self._payload("run.needs_input", job, session, lane, summary, request), reason)
+
+    def _payload(self, event, job, session, lane, summary, input_request):
         job, session, lane = job or {}, session or {}, lane or {}
         conversational = event in {"run.done", "run.error", "run.needs_input"}
         payload = {
@@ -72,17 +101,24 @@ class Notifications:
         payload["event_id"] = key if conversational else f"{key}:{payload['ts']}"
         if job.get("label"):
             payload["label"] = job["label"]
+        return payload
+
+    def preapproval(self, request, session):
+        """The option to answer with when policy pre-approves this tool prompt in this session, else None."""
         try:
-            # Only bounded enqueue is allowed here: caller may hold Store.cv.
-            owner = job.get("coordinator_subscriber_id") if conversational else None
-            if owner is None:
-                self.dispatcher.emit(payload)
-            else:
-                self.dispatcher.emit(payload, coordinator_subscriber_id=owner)
+            if not is_tool_approval(request):
+                return None
+            tool = request["title"][len("Allow tool:"):].strip()
+            rules = (getattr(self.dispatcher, "settings", None) or {}).get("tool_preapprovals") or ()
+            if not any(tool in tools and under_roots((session or {}).get("cwd"), (root,)) for root, tools in rules):
+                return None
+            return one_time_approval(request)
         except Exception:
-            # Notification failure must not change an agent's outcome. No exception
-            # text is logged because transports can embed secret endpoint values.
-            self.failures += 1
+            return None  # any doubt leaves the prompt to a person
+
+    def preapproved(self, job, session, lane, request):
+        if self.enabled:
+            self._record("preapproved", job, session, lane, request.get("title"), request)
 
     def started(self, job):
         if self.enabled:
@@ -139,20 +175,17 @@ class Notifications:
             questions = request.get("questions")
             first = questions[0] if isinstance(questions, list) and questions and isinstance(questions[0], dict) else {}
             summary = request.get("title") or first.get("question") or "Question or approval requires input"
-            grace = self._grace(request, session)
+            grace = self._grace()
             if grace:
                 state["held"][ui_id] = (self.clock() + grace, request, session, lane, summary)
                 continue
             self.emit("run.needs_input", job, session, lane, summary, input_request=request)
 
-    def _grace(self, request, session):
-        """Seconds to hold this prompt, or 0 to forward now (real questions, other roots, kill switch)."""
+    def _grace(self):
+        """Seconds to hold every prompt before forwarding it, or 0 (kill switch) to forward now."""
         try:
-            settings = getattr(self.dispatcher, "settings", None) or {}
-            seconds = settings.get("needs_input_grace_seconds") or 0
-            if seconds <= 0 or not is_tool_approval(request):
-                return 0
-            return seconds if under_roots((session or {}).get("cwd"), settings.get("needs_input_grace_roots") or ()) else 0
+            seconds = (getattr(self.dispatcher, "settings", None) or {}).get("needs_input_grace_seconds") or 0
+            return max(0, seconds)
         except Exception:
             return 0  # any doubt forwards immediately, as before this feature
 
@@ -171,15 +204,19 @@ class Notifications:
             for ui_id, (deadline, request, session, lane, summary) in list(held.items()):
                 if job is None or job.get("status") in TERMINAL or ui_id not in pending:
                     held.pop(ui_id)  # answered, cancelled, or the job moved on
+                    if self.enabled:
+                        self._record("resolved_within_grace", job, session, lane, summary, request)
                 elif force or now >= deadline:
                     held.pop(ui_id)
                     if self.enabled:
                         self.emit("run.needs_input", job, session, lane, summary, input_request=request)
 
     def finished(self, job, session, lane):
-        self.runs.pop(job["id"], None)
+        state = self.runs.pop(job["id"], None)
         if not self.enabled:
             return
+        for deadline, request, held_session, held_lane, summary in (state or {}).get("held", {}).values():
+            self._record("resolved_within_grace", job, held_session, held_lane, summary, request)
         self.emit("run.done" if job["status"] == "completed" else "run.error", job, session, lane,
                   summary=job.get("error") if job["status"] != "completed" else None)
         if lane:

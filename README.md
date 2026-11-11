@@ -8,7 +8,7 @@ Each operator uses their own installed CLI, login, configuration and project fil
 
 Webhooks are best-effort asynchronous notifications, not a durable queue. Configure subscribers in the private `webhooks.json` under the delegate state directory; protect endpoint/auth/HMAC values and send only to trusted receivers. `events` and `lanes` filter operational notifications. Subscriber `mode` is `conversation` or `monitor` and defaults to `monitor` for existing observer compatibility.
 
-Conversational events (`run.done`, `run.error`, `run.needs_input`) go only to the job's recorded `coordinator_subscriber_id`; owner selection overrides that subscriber's event/lane filters. Ownerless jobs remain available through `read`/`wait` and produce no conversational webhook. Set the coordinator subscriber to `mode: "conversation"` to keep operational events from waking Grok. Operational events (`run.deadline`, `run.stalled`, `lane.idle`, `daemon.up`) use normal event/lane filters and are delivered only to `monitor` subscribers. Notifications do not invoke a model or change OMP permissions.
+Only `run.done`, `run.error`, `run.needs_input` and `run.stalled` are ever posted. Each goes to the subscriber that the job's label maps to in `caller_routes`, or, for an unmapped label, to the job's recorded `coordinator_subscriber_id`; owner selection overrides that subscriber's event/lane filters. `run.stalled` also reaches `monitor` subscribers whose filters match. Ownerless jobs remain available through `read`/`wait` and produce no webhook. Every other event (`run.deadline`, `lane.idle`, `daemon.up`) and every unrouted event is appended only to the private local log `<state-dir>/logs/events-filtered.jsonl` (redacted, `0600`, rotated to `.1` at 1 MiB). Notifications do not invoke a model.
 
 Version 1 payloads include `channel` (`conversation` or `monitor`), `session_id`, `job_id`, and stable business `event_id`; terminal responses carry the full `message`, and questions carry `input_id` plus the full input request. The bounded `summary` is a diagnostic preview, not the response. Configured endpoint/auth/HMAC values are recursively redacted from user-visible string values, not structural keys or identifiers. `X-OMP-Delivery` remains stable across HTTP retries. Receivers should deduplicate by `event_id` before invoking Grok; HTTP delivery is best-effort and is not exactly-once. Verify configured HMAC signatures against raw request bytes before parsing.
 
@@ -40,10 +40,8 @@ Optional ticket-file dispatch uses `omp-dispatch LANE_ID /path/to/ticket.txt [ma
 The ticket must contain a non-empty `Must-have:` line. Set
 `OMP_COORDINATOR_SUBSCRIBER_ID` to the job's webhook owner; `--caller NAME` adds
 a caller label, and `--dry-run` previews the detached submission without dispatching.
-The wrapper uses the sibling `omp-delegate` executable and preserves the session's
-approval policy, including explicit `yolo`/`write` or inherited OMP defaults.
-Change that policy with `omp-delegate session configure SESSION_ID --approval-mode yolo`
-only when intended and the session is idle. Subscriber discovery and local monitoring
+The wrapper uses the sibling `omp-delegate` executable and never changes the session's
+approval mode. Subscriber discovery and local monitoring
 belong in private adapters, not this shared dispatcher.
 
 ## Use with an existing project
@@ -100,7 +98,7 @@ Backend choice is saved in `options.backend` and exposed in session/lane snapsho
 
 Codex requires an installed, authenticated Codex CLI. The worker uses its persistent headless app-server interface and resumes the saved native thread after daemon restart without replaying the task. Its thread identity is private delegate session state; deleting delegate-owned data does not purge Codex's native history. `OMP_DELEGATE_CODEX` selects the Codex executable (default `codex`); `OMP_DELEGATE_OMP` continues to select OMP.
 
-For Codex, `--model`, `--thinking` (turn effort), and repeated `--add-dir` (writable roots) are supported. `--config` file overlays, `--tools`, and `--profile` are rejected; the installed Codex app-server does not accept named profiles. Its inherited environment and native configuration remain authoritative. With no `--approval-mode`, Codex uses its configured policy. Explicit modes are approximate mappings, not semantic equivalences: `yolo` maps to `never` approval plus `danger-full-access`; `write` and `always-ask-cached` map to `on-request` plus `workspace-write`; `always-ask` maps to `untrusted` plus `workspace-write`.
+For Codex, `--model`, `--thinking` (turn effort), and repeated `--add-dir` (writable roots) are supported. `--config` file overlays, `--tools`, and `--profile` are rejected; the installed Codex app-server does not accept named profiles. Its inherited environment and native configuration remain authoritative. The daemon stores every session as `approval_mode: yolo`, which Codex receives as `never` approval plus `danger-full-access` (full-auto); any other requested mode is overridden.
 
 Kimi requires installed, authenticated Kimi Code CLI 2.5.3. It uses `kimi acp`, persists the native Kimi session ID privately, and resumes that session after daemon restart without replaying the task. Kimi retains its own conversation history; deleting delegate-owned data does not delete native Kimi history. The worker inherits the operator's Kimi environment, `KIMI_CODE_HOME`, login, configuration, skills, and target-project instructions; it does not copy credentials. `OMP_DELEGATE_KIMI` selects the executable (default `kimi`).
 
@@ -161,7 +159,9 @@ Environment variables:
 
 ## Approvals and questions
 
-Approval behavior is backend-specific. OMP workers inherit OMP's configured approval policy unless `approval_mode` is explicitly supplied. Codex inherits its own configured policy by default; explicit `--approval-mode` values map approximately, not identically: `yolo` to `never` plus `danger-full-access`; `write` and `always-ask-cached` to `on-request` plus `workspace-write`; `always-ask` to `untrusted` plus `workspace-write`. Approval mediation is not an OS sandbox. Never suppress an unresolved approval or grant permission on the coordinator's behalf.
+Approval mode is always yolo; the daemon enforces it on both backends.
+
+Every worker is stored with `approval_mode: yolo`. OMP workers start with `--approval-mode yolo`; Codex workers get `never` approval plus `danger-full-access` (Codex's full-auto equivalent). `approval_mode` is still accepted on `session create`/`configure` and the CLI for compatibility, but any value is stored as `yolo`; a non-yolo request writes one line to the daemon's stderr log and sends no webhook. Approval mediation is not an OS sandbox. Never suppress an unresolved approval or grant permission on the coordinator's behalf.
 
 Kimi always runs in native ACP `yolo` mode, auto-approving everything; a requested approval mode is stored as `yolo` for Kimi only. Existing OMP and Codex approval policies are unchanged.
 

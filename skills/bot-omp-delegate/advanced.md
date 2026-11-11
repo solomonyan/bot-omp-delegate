@@ -2,16 +2,28 @@
 
 Load this reference for webhook configuration/receivers, session retention/configuration, lane assignment/removal, or subagent control. Routine work uses lane create/list/show/run/close/new and the returned job ID.
 
+## Backend configuration
+
+Choose `--backend omp|codex` on `lane create` or `session create`; omission selects OMP. Backend selection is stored in `options.backend`. `session configure` may change supported worker options while settled, but cannot switch backend; create a new conversation to use another backend. OMP and Codex native conversation histories are not interchangeable.
+
+Codex requires an installed, authenticated Codex CLI and uses its persistent headless `codex app-server`, not `codex exec`. Set `OMP_DELEGATE_CODEX` to override the executable. Codex resumes its saved native thread after daemon restart without replaying the task. The thread ID is private delegate session state; purging delegate data does not purge Codex history.
+
+Codex supports `--model`, `--thinking` as turn effort, and repeated `--add-dir` as writable roots. It rejects `--config` file overlays, `--tools`, and `--profile`: the installed Codex app-server does not accept named profiles. Native Codex configuration and inherited environment remain authoritative. With no explicit approval mode, no permission override is sent. Explicit modes are approximate, not equivalent: `yolo` maps to `never` plus `danger-full-access`; `write` and `always-ask-cached` to `on-request` plus `workspace-write`; `always-ask` to `untrusted` plus `workspace-write`.
+
+Both backends share worktree exclusion and the detached submission, owner-routed webhook, answer, and same-session follow-up workflow. Codex is not feature-equivalent to OMP's native child controls or completion behavior. OMP `agent list/read/steer/cancel` and native parent continuation are OMP-specific; Codex must reject unavailable child-control operations rather than report fabricated results.
+
+Only command/file approvals and `requestUserInput` questions are mediated. Other native server requests, including unsupported permission/MCP elicitation requests, receive explicit errors rather than implicit grants. Prewarm-only native threads may be recreated because Codex has no persisted rollout yet; after any dispatch attempt, failed resumption is an error and never a reset or task replay.
+
 ## Questions and approvals
 
-Workers inherit OMP's configured approval policy unless an explicit `approval_mode` is supplied; existing explicit modes retain their behavior. A waiter or coordinator never grants permission on the owner's behalf. Inspect the full pending request and use its exact request ID and values/options:
+Approval behavior is backend-specific. OMP workers inherit OMP's configured approval policy unless an explicit `approval_mode` is supplied; existing explicit modes retain their OMP meaning. Codex inherits its own configured policy by default. Explicit modes are approximate mappings, not identical semantics: `yolo` means `never` approval plus `danger-full-access`; `write` and `always-ask-cached` mean `on-request` plus `workspace-write`; `always-ask` means `untrusted` plus `workspace-write`. A waiter or coordinator never grants permission on the owner's behalf. Inspect the full pending request and use its exact request ID and values/options:
 
 ```sh
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","confirmed":false}'
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","answers":[{"id":"QUESTION_ID","selectedOptions":["EXACT LABEL"]}]}'
 ```
 
-Do not suppress unresolved approval dialogs. OMP permission policy remains authoritative.
+Do not suppress unresolved approval dialogs. Each backend's permission policy remains authoritative.
 
 ## Session lifecycle
 
@@ -20,7 +32,7 @@ Do not suppress unresolved approval dialogs. OMP permission policy remains autho
 - `session open ID` optionally prewarms a worker. Closed, available sessions reopen lazily when dispatched.
 - `session close ID [--interrupt]` closes a worker but keeps its conversation. Without explicit interruption, busy close conflicts.
 - `session archive ID` stops a settled worker and rejects dispatch while retaining history. `session unarchive ID` makes it available again.
-- `session configure ID [worker flags]` merges options while settled and closes the idle worker so the next open applies them without erasing conversation history.
+- `session configure ID [worker flags]` merges supported options while settled and closes the idle worker so the next open applies them without erasing conversation history. It does not change the session backend.
 
 Closed and archived are distinct: closed means available for lazy resumption; archived means dispatch is disabled until unarchived.
 
@@ -43,7 +55,7 @@ omp-delegate agent steer JOB_ID AGENT_ID "Additional direction"
 omp-delegate agent cancel JOB_ID AGENT_ID
 ```
 
-Cancellation is an OMP control request, not an OS-level hard kill. Descendant cleanup depends on OMP's supported behavior; detached tools, external side effects, and unrelated processes may continue. A stale parent job must not be redirected to a successor worker. Use job events and full session history only when the investigation requires them.
+Cancellation is an OMP control request, not an OS-level hard kill. These native child controls are not available for Codex unless separately implemented; report unsupported operations rather than returning invented agent data. OMP descendant cleanup depends on its supported behavior; detached tools, external side effects, and unrelated processes may continue. A stale parent job must not be redirected to a successor worker. Use job events and full session history only when the investigation requires them.
 
 Native `task` results wake their owning OMP parent session in-process. A `prompt_result` with `sessionSettled: false` is a yield, not final job completion: the delegate retains the same worker/job and worktree ownership through child-result delivery and resumed parent output, then settles on `session_settled`. Do not relay the result as another prompt or create a second parent session. Reopening with `--continue` is separate conversation persistence, not the result wake path.
 

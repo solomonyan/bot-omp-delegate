@@ -94,6 +94,10 @@ class _FrameDecoder:
             raise RuntimeError("Truncated RPC output")
 
 
+class NoActiveTurn(ValueError):
+    """The worker has no native turn awaiting control."""
+
+
 class PendingRpc:
     """A sent RPC command whose response can be awaited outside a state lock."""
 
@@ -107,11 +111,11 @@ class PendingRpc:
             try:
                 response = self.waiter.get(timeout=timeout)
             except queue.Empty as exc:
-                raise RuntimeError("Timed out waiting for OMP RPC response") from exc
+                raise RuntimeError("Timed out waiting for worker RPC response") from exc
             if isinstance(response, Exception):
                 raise RuntimeError(str(response)) from response
             if not response.get("success"):
-                raise RuntimeError(str(response.get("error", "OMP RPC command failed")))
+                raise RuntimeError(str(response.get("error", "Worker RPC command failed")))
             return response.get("data")
         finally:
             self.cancel()
@@ -122,6 +126,8 @@ class PendingRpc:
 
 
 class Worker:
+    backend = "omp"
+
     def __init__(self, cwd: str, session_dir: str, options: dict, on_event: Callable[[dict], None]):
         self.cwd, self.session_dir, self.options, self.on_event = cwd, session_dir, dict(options or {}), on_event
         self.process = None
@@ -158,7 +164,7 @@ class Worker:
             cmd += ["--add-dir", str(value)]
         return cmd
 
-    def start(self):
+    def _spawn(self):
         with self._lifecycle_lock:
             if self._closed.is_set():
                 raise RuntimeError("Worker was closed before startup")
@@ -177,9 +183,12 @@ class Worker:
                 )
             except OSError as exc:
                 self._stderr_file.close()
-                raise RuntimeError(f"Unable to start omp: {exc}") from exc
-            self._reader = threading.Thread(target=self._read_stdout, name="omp-rpc-reader", daemon=True)
+                raise RuntimeError(f"Unable to start {self.backend}: {exc}") from exc
+            self._reader = threading.Thread(target=self._read_stdout, name=f"{self.backend}-rpc-reader", daemon=True)
             self._reader.start()
+
+    def start(self):
+        self._spawn()
         try:
             frame = self._frames.get(timeout=30)
         except queue.Empty as exc:
@@ -263,21 +272,21 @@ class Worker:
 
     def _send(self, frame):
         if self._closed.is_set() or not self.alive:
-            raise RuntimeError("OMP RPC worker is not running")
+            raise RuntimeError(f"{self.backend} RPC worker is not running")
         raw = json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
         if len(raw) > 1_048_576:
-            raise ValueError("OMP input frame exceeds 1 MiB")
+            raise ValueError("Worker input frame exceeds 1 MiB")
         with self._write_lock:
             try:
                 remaining = memoryview(raw)
                 while remaining:
                     written = self.process.stdin.write(remaining)
                     if not written:
-                        raise RuntimeError("OMP stdin closed during command delivery")
+                        raise RuntimeError("Worker stdin closed during command delivery")
                     remaining = remaining[written:]
                 self.process.stdin.flush()
             except (OSError, BrokenPipeError) as exc:
-                raise RuntimeError(f"Unable to write to OMP RPC process: {exc}") from exc
+                raise RuntimeError(f"Unable to write to {self.backend} RPC process: {exc}") from exc
 
     def begin_request(self, command: str, **payload):
         request_id = f"delegate-{uuid.uuid4().hex}"
@@ -300,6 +309,23 @@ class Worker:
 
     def respond_ui(self, response: dict) -> None:
         self._send({"type": "extension_ui_response", **response})
+
+    def configure(self, name):
+        self.request("set_session_name", name=name)
+        self.request("set_ask_dialog", enabled=True)
+        self.request("set_subagent_subscription", level="events")
+
+    def begin_control(self, action, **payload):
+        commands = {"steer": "steer", "interrupt": "abort_and_restore_queue"}
+        return self.begin_request(commands[action], **payload)
+
+    def begin_agent(self, action, **payload):
+        commands = {"list": "get_subagents", "read": "get_subagent_messages",
+                    "steer": "steer_subagent", "cancel": "cancel_subagent"}
+        return self.begin_request(commands[action], **payload)
+
+    def compact(self):
+        return self.request("compact")
 
     @staticmethod
     def _signal_group(process, sig):
@@ -327,24 +353,24 @@ class Worker:
             except subprocess.TimeoutExpired:
                 self._signal_group(process, signal.SIGKILL)
                 process.wait(timeout=2)
-        # OMP may have exited before its same-group descendants. Detached jobs are
+        # A worker may exit before its same-group descendants. Detached jobs are
         # outside this process group and cannot be promised to stop.
         self._signal_group(process, signal.SIGTERM)
         time.sleep(0.05)
         self._signal_group(process, signal.SIGKILL)
         if process.poll() is None:
-            raise RuntimeError("OMP process did not stop")
+            raise RuntimeError("Worker process did not stop")
 
     def close(self):
         with self._lifecycle_lock:
             self._closed.set()
             process = self.process
-        self._fail_pending(RuntimeError("OMP worker closed"))
+        self._fail_pending(RuntimeError("Worker closed"))
         self._stop_process(process, graceful=True)
         if self._reader and self._reader is not threading.current_thread():
             self._reader.join(timeout=2)
             if self._reader.is_alive():
-                raise RuntimeError("OMP event reader did not finish shutdown")
+                raise RuntimeError("Worker event reader did not finish shutdown")
         if process is not None:
             process.stdin.close()
             process.stdout.close()

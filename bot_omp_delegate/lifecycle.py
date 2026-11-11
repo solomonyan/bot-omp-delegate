@@ -1,4 +1,4 @@
-"""Durable lane/conversation state and serialized OMP worker lifecycles."""
+"""Durable lane/conversation state and serialized coding worker lifecycles."""
 from __future__ import annotations
 
 import copy
@@ -11,12 +11,13 @@ import threading
 import time
 import uuid
 
-from .worker import Worker
+from .worker import NoActiveTurn, Worker
+from .codex_worker import CodexWorker
 from .notifications import Notifications
 
 TERMINAL = {"completed", "aborted", "error", "interrupted"}
 INPUT_METHODS = {"select", "confirm", "input", "editor", "ask"}
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 
 class Conflict(ValueError):
@@ -51,7 +52,7 @@ def text(data, field):
 def validate_options(options):
     if not isinstance(options, dict):
         raise ValueError("options must be an object")
-    allowed = {"model", "thinking", "profile", "config", "add_dir", "tools", "approval_mode"}
+    allowed = {"backend", "model", "thinking", "profile", "config", "add_dir", "tools", "approval_mode"}
     if set(options) - allowed:
         raise ValueError("Unknown worker option")
     for key, value in options.items():
@@ -62,6 +63,17 @@ def validate_options(options):
             raise ValueError(f"{key} must be a non-empty string")
     if options.get("approval_mode", "always-ask") not in {"always-ask", "always-ask-cached", "write", "yolo"}:
         raise ValueError("Unknown approval_mode")
+    backend = options.get("backend", "omp")
+    if backend not in {"omp", "codex"}:
+        raise ValueError("Unknown worker backend")
+    if backend == "codex":
+        for field in ("config", "tools", "profile"):
+            if options.get(field):
+                raise ValueError(f"{field} is not supported by the Codex app-server backend; use Codex's own configuration")
+        if options.get("thinking") is not None and options["thinking"] not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+            raise ValueError("Unknown Codex reasoning effort")
+        if any(not Path(path).is_dir() for path in options.get("add_dir", [])):
+            raise ValueError("Codex add_dir must contain directories")
     return copy.deepcopy(options)
 
 
@@ -90,7 +102,7 @@ class Store:
         path = self.root / "state.json"
         if path.exists():
             state = self._load(path, {})
-            if state.get("version") != STATE_VERSION:
+            if state.get("version") not in {1, STATE_VERSION}:
                 raise ValueError("Unsupported lifecycle state version")
             self.sessions = state["sessions"]
             self.lanes = state["lanes"]
@@ -289,6 +301,7 @@ class Store:
 
     def _snapshot_session(self, session):
         result = copy.deepcopy(session)
+        result["backend"] = session["options"].get("backend", "omp")
         worker = self.workers.get(session["id"])
         result["worker"]["pid"] = worker.pid if worker is not None else None
         return result
@@ -313,8 +326,9 @@ class Store:
             if self.closing or session["worker"]["state"] == "closing":
                 raise Conflict("Worker startup cancelled")
             generation = uuid.uuid4().hex
-            worker = Worker(session["cwd"], session["sessionDir"], session["options"],
-                            lambda frame: self.event(sid, frame, generation))
+            worker_type = CodexWorker if session["options"].get("backend", "omp") == "codex" else Worker
+            worker = worker_type(session["cwd"], session["sessionDir"], session["options"],
+                                 lambda frame: self.event(sid, frame, generation))
             self.workers[sid] = worker
             session["worker"] = {"state": "starting", "pid": None, "generation": generation, "error": None}
             if session["activeJob"]:
@@ -324,9 +338,7 @@ class Store:
             self._save_state()
         try:
             worker.start()
-            worker.request("set_session_name", name=session["name"])
-            worker.request("set_ask_dialog", enabled=True)
-            worker.request("set_subagent_subscription", level="events")
+            worker.configure(session["name"])
             with self.cv:
                 if self.closing or self.workers.get(sid) is not worker or session["worker"]["state"] == "closing":
                     raise Conflict("Worker startup cancelled")
@@ -432,7 +444,7 @@ class Store:
                 if not alive:
                     self.workers.pop(sid, None)
                 self.ready.discard(sid)
-                session["worker"].update(state="failed", pid=worker.pid if alive else None, error=frame.get("error", "OMP exited"))
+                session["worker"].update(state="failed", pid=worker.pid if alive else None, error=frame.get("error", "Worker exited"))
             elif kind == "ready":
                 worker = self.workers.get(sid)
                 session["worker"]["pid"] = worker.pid if worker is not None else None
@@ -498,7 +510,7 @@ class Store:
             elif kind == "session_settled" and "resultStatus" in job:
                 self._result(job)
             elif kind == "delegate_worker_exit":
-                self._finish(job, "aborted" if job.get("cancelRequested") else "error", frame.get("error", "OMP exited"))
+                self._finish(job, "aborted" if job.get("cancelRequested") else "error", frame.get("error", "Worker exited"))
             if changed:
                 self._save_job(job)
             self.cv.notify_all()
@@ -539,14 +551,14 @@ class Store:
                 self.cv.notify_all()
                 return copy.deepcopy(job)
             if action == "steer":
-                command, payload = "steer", {"message": text(data, "message")}
+                payload = {"message": text(data, "message")}
             elif action == "interrupt":
-                command, payload = "abort_and_restore_queue", {}
+                payload = {}
             else:
                 raise KeyError("Unknown job action")
             self.reserved.add(sid)
             try:
-                ticket = worker.begin_request(command, **payload)
+                ticket = worker.begin_control(action, **payload)
             except Exception:
                 self._release(sid)
                 raise
@@ -561,7 +573,7 @@ class Store:
         with self.cv:
             job, session, worker = self._job_worker(jid, mutation=action in {"steer", "cancel"})
             if action == "list":
-                command, payload = "get_subagents", {}
+                payload = {}
             elif action in {"read", "steer", "cancel"}:
                 payload = {"subagentId": text(data, "subagentId")}
                 if payload["subagentId"] not in job.get("subagents", {}):
@@ -571,18 +583,14 @@ class Store:
                     if type(offset) is not int or offset < 0:
                         raise ValueError("fromByte must be a non-negative integer")
                     payload["fromByte"] = offset
-                    command = "get_subagent_messages"
                 elif action == "steer":
                     payload["message"] = text(data, "message")
-                    command = "steer_subagent"
-                else:
-                    command = "cancel_subagent"
             else:
                 raise KeyError("Unknown agent action")
             sid = session["id"]
             self.reserved.add(sid)
             try:
-                ticket = worker.begin_request(command, **payload)
+                ticket = worker.begin_agent(action, **payload)
             except Exception:
                 self._release(sid)
                 raise
@@ -590,7 +598,7 @@ class Store:
             result = ticket.result()
             if action == "list":
                 if not isinstance(result, dict) or not isinstance(result.get("subagents"), list):
-                    raise RuntimeError("Invalid OMP subagent registry response")
+                    raise RuntimeError("Invalid worker subagent registry response")
                 result = dict(result, subagents=[child for child in result["subagents"]
                               if child.get("id") in job.get("subagents", {})])
             return {"jobId": jid, "workerGeneration": job["workerGeneration"], "result": result}
@@ -643,7 +651,11 @@ class Store:
             ticket = None
             if worker is not None and not startup and jid is not None:
                 try:
-                    ticket = worker.begin_request("abort_and_restore_queue")
+                    ticket = worker.begin_control("interrupt")
+                except NoActiveTurn:
+                    # The native turn can settle before its terminal event
+                    # acquires cv. Keep ownership until that event is recorded.
+                    pass
                 except Exception:
                     self.interrupting.discard(sid)
                     self._release(sid)
@@ -680,9 +692,16 @@ class Store:
                 return self._interrupt_close(sid)
         if action not in {"open", "close", "archive", "unarchive", "configure", "delete"}:
             raise KeyError("Unknown session action")
-        options = validate_options(data.get("options", {})) if action == "configure" else None
         with self.cv:
             session = self.session(sid)
+            if action == "configure":
+                incoming = data.get("options", {})
+                if not isinstance(incoming, dict):
+                    raise ValueError("options must be an object")
+                backend = session["options"].get("backend", "omp")
+                if incoming.get("backend", backend) != backend:
+                    raise Conflict("A conversation's backend cannot change; create a new session or lane")
+                options = validate_options({**session["options"], **incoming})
             if action == "open" and session["availability"] != "available":
                 raise Conflict("Session is archived")
             worker = self.workers.get(sid)
@@ -723,7 +742,7 @@ class Store:
                 raise Conflict("Session is archived")
             self._reserve(sid)
         try:
-            return self._worker(sid).request("compact")
+            return self._worker(sid).compact()
         finally:
             self._release(sid)
 
@@ -745,6 +764,7 @@ class Store:
         session = self.session(lane["sessionId"])
         job = self.jobs.get(session["activeJob"], {})
         return dict(copy.deepcopy(lane), activeJob=session["activeJob"], availability=session["availability"],
+                    backend=session["options"].get("backend", "omp"),
                     worker=self._snapshot_session(session)["worker"], pendingInput=copy.deepcopy(job.get("pendingInput", [])),
                     lastError=session["worker"]["error"])
 

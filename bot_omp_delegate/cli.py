@@ -113,7 +113,7 @@ def _worker_options(parser: argparse.ArgumentParser) -> None:
 
 def _options(args: argparse.Namespace) -> dict[str, Any]:
     values = vars(args)
-    options = {key: values[key] for key in ("model", "thinking", "profile", "tools", "approval_mode")
+    options = {key: values[key] for key in ("backend", "model", "thinking", "profile", "tools", "approval_mode")
                if values.get(key) is not None}
     for field in ("config", "add_dir"):
         paths = values.get(field) or []
@@ -129,7 +129,7 @@ def _options(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="omp-delegate", description="Manage OMP delegated sessions and jobs.")
+    parser = argparse.ArgumentParser(prog="omp-delegate", description="Manage OMP and Codex delegated sessions and jobs.")
     parser.add_argument("--state-dir", help="daemon state directory (default: ~/.omp-delegate)")
     parser.add_argument("--port", type=int, help="loopback daemon port (default: 4510)")
     subs = parser.add_subparsers(dest="command", required=True)
@@ -151,6 +151,7 @@ def _parser() -> argparse.ArgumentParser:
     create = sess.add_parser("create")
     create.add_argument("--name", required=True)
     create.add_argument("--cwd", required=True)
+    create.add_argument("--backend", choices=("omp", "codex"), help="worker backend (default: omp)")
     _worker_options(create)
     listing = sess.add_parser("list")
     listing.add_argument("--archived", action="store_true")
@@ -171,6 +172,7 @@ def _parser() -> argparse.ArgumentParser:
     lane_create = lanes.add_parser("create")
     lane_create.add_argument("--name", required=True)
     lane_create.add_argument("--cwd", required=True)
+    lane_create.add_argument("--backend", choices=("omp", "codex"), help="worker backend (default: omp)")
     _worker_options(lane_create)
     lanes.add_parser("list")
     for action in ("show", "new"):

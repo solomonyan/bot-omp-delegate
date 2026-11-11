@@ -150,7 +150,7 @@ class LifecycleBehaviorTests(unittest.TestCase):
         class Worker:
             pid = 100
             alive = True
-            def begin_request(self, *_args, **_kwargs): return Ticket()
+            def begin_agent(self, *_args, **_kwargs): return Ticket()
         self.store.workers[sid] = Worker()
         self.store.ready.add(sid)
         self.store.session(sid)["worker"].update(state="idle", generation="same-worker")
@@ -217,7 +217,7 @@ class LifecycleBehaviorTests(unittest.TestCase):
         class Worker:
             alive = True
             pid = 100
-            def begin_request(self, *_args, **_kwargs): return Ticket()
+            def begin_control(self, *_args, **_kwargs): return Ticket()
         lane = self.store.create_lane({"name": "race", "cwd": str(self.cwd)})
         sid = lane["sessionId"]
         self.store.workers[sid] = Worker()
@@ -325,6 +325,52 @@ class LifecycleBehaviorTests(unittest.TestCase):
         self.assertNotIn(job["id"], restarted.jobs)
         self.assertFalse(directory.exists())
         self.assertFalse((self.root / "purge.json").exists())
+
+    def test_conversation_backend_cannot_be_changed_by_configure(self):
+        for backend, other in (("omp", "codex"), ("codex", "omp")):
+            with self.subTest(backend=backend):
+                session = self.store.create({"name": backend, "cwd": str(self.cwd),
+                                             "options": {"backend": backend, "model": "original"}})
+                with self.assertRaisesRegex(Conflict, "backend cannot change"):
+                    self.store.session_action(session["id"], "configure",
+                                              {"options": {"backend": other, "model": "replacement"}})
+                saved = self.store.show_session(session["id"])
+                self.assertEqual((saved["backend"], saved["options"]["model"]), (backend, "original"))
+                self.assertEqual(saved["sessionDir"], session["sessionDir"])
+
+    def test_codex_configuration_is_validated_with_saved_backend(self):
+        session = self.store.create({"name": "codex", "cwd": str(self.cwd),
+                                     "options": {"backend": "codex", "thinking": "low"}})
+        for invalid in ({"tools": "bash"}, {"config": [str(self.cwd)]}, {"profile": "named"}, {"thinking": "invalid"}):
+            with self.subTest(options=invalid):
+                with self.assertRaises(ValueError):
+                    self.store.session_action(session["id"], "configure", {"options": invalid})
+                self.assertEqual(self.store.show_session(session["id"])["options"],
+                                 {"backend": "codex", "thinking": "low"})
+
+    def test_codex_lane_keeps_backend_after_restart_and_new_conversation(self):
+        lane = self.store.create_lane({"name": "codex", "cwd": str(self.cwd),
+                                       "options": {"backend": "codex", "thinking": "low"}})
+        restarted = Store(self.root)
+        self.addCleanup(restarted.close)
+        replacement = restarted.lane_action(lane["id"], "new", {})
+        self.assertEqual(replacement["backend"], "codex")
+        self.assertNotEqual(replacement["sessionId"], lane["sessionId"])
+        self.assertEqual(restarted.show_session(replacement["sessionId"])["options"],
+                         {"backend": "codex", "thinking": "low"})
+
+    def test_version_one_state_keeps_existing_conversations_as_omp(self):
+        session = self.store.create({"name": "legacy", "cwd": str(self.cwd)})
+        path = self.root / "state.json"
+        state = json.loads(path.read_text())
+        state["version"] = 1
+        path.write_text(json.dumps(state))
+        restarted = Store(self.root)
+        self.addCleanup(restarted.close)
+        restored = restarted.show_session(session["id"])
+        self.assertEqual(restored["backend"], "omp")
+        self.assertEqual(restored["sessionDir"], session["sessionDir"])
+        self.assertEqual(json.loads(path.read_text())["version"], 2)
 
 if __name__ == "__main__":
     unittest.main()

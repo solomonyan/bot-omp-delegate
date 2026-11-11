@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- Add persistent Codex app-server sessions selectable at lane/session creation, with immutable backend choice and shared detached webhook/answer workflow; document Codex setup, option and approval mappings, history retention, and OMP-only controls.
+- Codex verification on macOS with CLI 0.167.1: 86 targeted regression checks passed; real model-backed smokes retained conversation memory across worker close and daemon restart, delivered full owner-routed responses, rejected an OMP writer while Codex owned the worktree, mediated a native command approval with explicit denial, and exercised native steering/interruption while approval was pending. Offline native-peer coverage includes questions, compaction settlement, stale events, failed resumption and transport exit. Production daemon and external Grok receiver were not changed or exercised. Codex named profiles and direct OMP-style child controls are explicitly unsupported.
+- Fix Codex interrupt-close racing with an already completed native turn: retain worktree ownership until its pending terminal event is recorded, then close normally instead of leaving the session in `closing`. A deterministic stdio-peer regression reproduced the stuck state before the fix; all 16 targeted backend/startup/control checks passed afterward. The pre-fix full suite passed 106 tests under the CI Python 3.11 version.
 
 - Add a versioned `omp-dispatch` ticket wrapper that preserves session approval settings instead of reconfiguring permissions before every job. Keep machine-specific subscriber discovery and monitoring in private local adapters.
 - Route conversational notifications (`run.done`, `run.error`, `run.needs_input`) only to the recorded coordinator subscriber; add conversation/monitor modes, full response/input payloads, stable event identity, and event-based receiver deduplication guidance. Operational events remain monitor-only.

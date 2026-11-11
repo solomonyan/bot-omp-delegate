@@ -1,6 +1,6 @@
 # bot-omp-delegate
 
-Let Grok Bot delegate work to a resident local OMP or Codex worker, retain project context, and steer or interrupt work without repeated model turns.
+Let Grok Bot delegate work to a resident local OMP, Codex, or Kimi worker, retain project context, and use the shared job, answer, and interruption workflow.
 Each operator uses their own installed CLI, login, configuration and project files. Provider credentials are not bundled with the project.
 
 
@@ -19,10 +19,11 @@ The daemon's delivery queue is bounded; shutdown or queue saturation can lose no
 
 ## Requirements and setup
 
-- macOS or Linux; Python 3.11+; install and authenticate OMP, Codex CLI, or both for the backend you select.
+- macOS or Linux; Python 3.11+; install and authenticate OMP, Codex CLI, and/or Kimi Code CLI for the backend you select.
 - No Python packages or JavaScript dependencies to install.
 - OMP requires RPC v2 negotiation, `prompt_result`, `session_settled`, and `abort_and_restore_queue`.
 - Codex uses the persistent headless `codex app-server` protocol, not one-shot `codex exec`. Verified with Codex CLI 0.167.1; see [backend configuration](#backend-selection-and-configuration).
+- Kimi uses the persistent `kimi acp` protocol. Install and authenticate Kimi Code CLI 2.5.3 locally before selecting it; see [backend configuration](#backend-selection-and-configuration).
 
 ```sh
 git clone https://github.com/solomonyan/bot-omp-delegate.git
@@ -52,9 +53,10 @@ Grok provides the task; the delegate starts the selected installed CLI in the ta
 ```mermaid
 flowchart LR
     A[Grok Bot] -->|Task| B[Local delegate daemon]
-    B -->|Backend-specific stdio RPC| C[Persistent OMP or Codex worker]
+    B[Local delegate daemon] -->|Backend-specific stdio RPC| C[Persistent OMP, Codex, or Kimi worker]
     D[Global OMP setup] -->|OMP only| C
     F[Codex login and config] -->|Codex only| C
+    G[Kimi login, config, and skills] -->|Kimi only| C
     E[Target project config and instructions] --> C
     C -->|Questions and settled result| B
     B -->|Owner-routed webhook| A
@@ -90,18 +92,26 @@ Select a backend when creating a conversation; omission means `omp`:
 
 ```sh
 omp-delegate lane create --name project --cwd "$PROJECT" --backend codex
+omp-delegate lane create --name kimi-project --cwd "$PROJECT" --backend kimi
 omp-delegate session create --name project-task --cwd "$PROJECT" --backend omp
 ```
 
-Backend choice is saved in `options.backend` and exposed in session/lane snapshots; `session configure` cannot change it. `lane new` creates a fresh conversation on that lane's existing backend. To choose another backend, create a new lane or create a session with the desired backend and assign it; selecting another backend starts its own native history, not a continuation of the prior backend's history.
+Backend choice is saved in `options.backend` and exposed in session/lane snapshots; `session configure` cannot change it. `lane new` creates a fresh conversation on that lane's existing backend. To choose another backend, create a new lane or create a session with the desired backend and assign it; each backend owns separate native history.
 
 Codex requires an installed, authenticated Codex CLI. The worker uses its persistent headless app-server interface and resumes the saved native thread after daemon restart without replaying the task. Its thread identity is private delegate session state; deleting delegate-owned data does not purge Codex's native history. `OMP_DELEGATE_CODEX` selects the Codex executable (default `codex`); `OMP_DELEGATE_OMP` continues to select OMP.
 
 For Codex, `--model`, `--thinking` (turn effort), and repeated `--add-dir` (writable roots) are supported. `--config` file overlays, `--tools`, and `--profile` are rejected; the installed Codex app-server does not accept named profiles. Its inherited environment and native configuration remain authoritative. With no `--approval-mode`, Codex uses its configured policy. Explicit modes are approximate mappings, not semantic equivalences: `yolo` maps to `never` approval plus `danger-full-access`; `write` and `always-ask-cached` map to `on-request` plus `workspace-write`; `always-ask` maps to `untrusted` plus `workspace-write`.
 
-The Grok detached-submit, owner-routed webhook, question/answer and same-session follow-up workflow is unchanged across backends. Both backends share the same worktree exclusion. Codex does not provide feature parity with OMP-native child controls or completion behavior; OMP subagent controls and native parent continuation remain OMP-specific.
+Kimi requires installed, authenticated Kimi Code CLI 2.5.3. It uses `kimi acp`, persists the native Kimi session ID privately, and resumes that session after daemon restart without replaying the task. Kimi retains its own conversation history; deleting delegate-owned data does not delete native Kimi history. The worker inherits the operator's Kimi environment, `KIMI_CODE_HOME`, login, configuration, skills, and target-project instructions; it does not copy credentials. `OMP_DELEGATE_KIMI` selects the executable (default `kimi`).
+
+For Kimi, `--model` (native model aliases), `--thinking` (`low`, `high`, or `max`), and repeated `--add-dir` roots are supported; extra directories apply only when creating the native session. `--config`, `--profile`, and `--tools` are rejected, and Kimi roots cannot be changed through session configure. The daemon enforces `approval_mode: yolo` on every Kimi startup/resume using ACP mode `yolo`, which means auto-approve everything; this is not an OS sandbox.
+
+The Grok detached-submit, owner-routed webhook, question/answer and same-session follow-up workflow is shared across backends. Existing conversation/monitor routing is unchanged. All backends share worktree exclusion. OMP-native child controls and parent continuation remain OMP-specific. Kimi explicitly rejects steer, manual compact, and direct child controls; no queued-prompt or fake-success fallback is used.
 
 Codex stores `codex-thread.json` privately in the delegate session directory. Prewarm-only threads have no native rollout and may receive a new empty native identity on reopen. Before the first prompt is sent, the delegate durably records the dispatch attempt; subsequent resume failures are errors, never a reset or automatic prompt replay. Command/file approvals and user-input questions are supported; other native server requests receive explicit unsupported-operation errors.
+
+Kimi's permission selection must answer with `value` set to the exact native `optionId`; never substitute an option label or implicitly choose a remembered allow. Kimi elicitation uses `ask` questions and answer `answers` entries keyed by question ID with exact `selectedOptions` values, or `text` for free-text questions where applicable. The Grok owner-routed webhook and existing answer path remain unchanged.
+
 
 ### Native parent continuation
 
@@ -122,7 +132,7 @@ Lane labels are coordination metadata, not authorization: clients sharing a daem
 
 ## Upgrading existing state
 
-Finish or explicitly interrupt existing jobs, stop the old daemon, update the code, then start the daemon with the same state directory and port. The current state format is version 2; startup migrates version 1 and legacy `sessions.json`, preserving sessions, jobs, transcripts and options. The legacy metadata file is removed only after the new state is written. Do not run an older daemon against version 2 state. Existing sessions are not assigned to lanes automatically: create a lane and explicitly adopt a saved session with `lane assign` if needed.
+Finish or explicitly interrupt existing jobs, stop the old daemon, update the code, then start the daemon with the same state directory and port. The current state format is version 3; startup migrates versions 1 and 2 and legacy `sessions.json`, preserving sessions, jobs, transcripts and options. The legacy metadata file is removed only after the new state is written. Do not run an older daemon against version 3 state. Existing sessions are not assigned to lanes automatically: create a lane and explicitly adopt a saved session with `lane assign` if needed.
 
 Worker processes are runtime resources, not persisted conversations. After restart, workers start stopped and unfinished jobs remain interrupted/aborted; no prompts are replayed. Archived state and lane assignment/history persist. Failed cleanup keeps a worker quarantined rather than admitting a replacement writer. An interrupted purge is recovered on the next startup.
 
@@ -130,9 +140,9 @@ Do not run an older version against a migrated state directory: it does not unde
 
 ## Reuse your backend setup
 
-OMP workers run the installed `omp` with its inherited environment and the target project's `--cwd`. OMP discovers global credentials, skills, extensions, custom tools and configured models, plus target-project configuration such as `.omp/config.yml` and instructions such as `AGENTS.md`. Codex workers use the operator's installed, authenticated Codex CLI and its own configuration and project instructions through the persistent headless app-server; they do not use `codex exec`. Project-local setup applies to that target project; it is not exported to unrelated projects. Provider credentials are neither copied into this repository nor returned to Grok. An explicitly permitted tool can still access files available to the OS user; the delegate is not a credential-isolation sandbox.
+OMP workers run the installed `omp` with its inherited environment and the target project's `--cwd`. OMP discovers global credentials, skills, extensions, custom tools and configured models, plus target-project configuration such as `.omp/config.yml` and instructions such as `AGENTS.md`. Codex workers use the operator's installed, authenticated Codex CLI and its own configuration and project instructions through the persistent headless app-server; they do not use `codex exec`. Kimi workers use the operator's installed, authenticated Kimi CLI, `KIMI_CODE_HOME`, native configuration and skills, plus target-project instructions through ACP. Project-local setup applies to that target project; it is not exported to unrelated projects. Provider credentials are neither copied into this repository nor returned to Grok. An explicitly permitted tool can still access files available to the OS user; the delegate is not a credential-isolation sandbox.
 
-Session and lane creation accept `--backend omp|codex` (default `omp`) plus backend-specific worker options. `--config` and `--add-dir` paths must be absolute and already exist; relative paths are rejected. Options are saved with the session; use `session configure ID` while settled to change supported options, but backend selection is immutable. OMP profiles retain their native credentials/configuration behavior; Codex option limits are listed above.
+Session and lane creation accept `--backend omp|codex|kimi` (default `omp`) plus backend-specific worker options. `--config` and `--add-dir` paths must be absolute and already exist; relative paths are rejected. Options are saved with the session; use `session configure ID` while settled to change supported options, but backend selection is immutable. OMP profiles retain their native credentials/configuration behavior; Codex and Kimi option limits are listed above. Kimi additional roots are creation-only and immutable for that conversation.
 
 
 RPC pins some OMP defaults differently from interactive mode, notably task isolation/execution, memory, advisor and async behavior. Explicit OMP global/project configuration and overlays remain authoritative. This delegate preserves discovery; it does not promise that an RPC worker behaves identically to the current interactive chat. Tools needing interactive MCP login must be authenticated separately before delegation.
@@ -144,6 +154,7 @@ Environment variables:
 | `OMP_DELEGATE_STATE` | Private state directory; default `~/.omp-delegate` |
 | `OMP_DELEGATE_PORT` | Loopback HTTP port; default `4510` |
 | `OMP_DELEGATE_OMP` | OMP executable path; default `omp` |
+| `OMP_DELEGATE_KIMI` | Kimi executable path; default `kimi` |
 | `OMP_DELEGATE_CODEX` | Codex executable path; default `codex` |
 
 `--state-dir` and `--port` precede the CLI subcommand and override their environment defaults. Daemon environment changes take effect after a restart.
@@ -152,14 +163,18 @@ Environment variables:
 
 Approval behavior is backend-specific. OMP workers inherit OMP's configured approval policy unless `approval_mode` is explicitly supplied. Codex inherits its own configured policy by default; explicit `--approval-mode` values map approximately, not identically: `yolo` to `never` plus `danger-full-access`; `write` and `always-ask-cached` to `on-request` plus `workspace-write`; `always-ask` to `untrusted` plus `workspace-write`. Approval mediation is not an OS sandbox. Never suppress an unresolved approval or grant permission on the coordinator's behalf.
 
+Kimi always runs in native ACP `yolo` mode, auto-approving everything; a requested approval mode is stored as `yolo` for Kimi only. Existing OMP and Codex approval policies are unchanged.
+
 A job with a pending request reports `status: waiting_input` and `pendingInput`. Conversational webhook delivery includes the full question request and `input_id`; Grok answers through the existing control path only after resolving the request under the owner's policy:
 
 ```sh
 omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","confirmed":false}'
-omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","answers":[{"id":"QUESTION_ID","selectedOptions":["EXACT OPTION"]}]}'
+omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","value":"EXACT_OPTION_ID"}'
+omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","answers":[{"id":"q0","selectedOptions":["EXACT_LABEL"]},{"id":"q1","selectedOptions":["A","B"]}]}'
+omp-delegate answer JOB_ID --json '{"id":"UI_REQUEST_ID","answers":[{"id":"q0","text":"free-form response"}]}'
 ```
 
-Use the exact request ID and values/options from `pendingInput`. OMP's own dialog timeout behavior still applies; for example, an `ask` timeout can select recommended/first options. Codex requests are answered through the same CLI workflow using native Codex replies.
+Use the exact request ID and values/options from `pendingInput`. For a Kimi permission `select` request, answer with the exact `optionId` in `value`; `confirmed` is applicable only when exactly one `allow_once`/`reject_once` option maps unambiguously to true/false. Never infer a selection from an option name or implicitly choose remembered allow/reject options. Kimi form elicitation is exposed as `ask` questions; answer with every required question ID and exact enum labels in `selectedOptions`, or `text` where the question accepts free text. Invalid or partial answers must be corrected through the same pending request. OMP's own dialog timeout behavior still applies; for example, an `ask` timeout can select recommended/first options. Codex requests use the same CLI workflow with native Codex replies.
 
 ## Grok Bot workflow
 
@@ -171,8 +186,8 @@ The Grok Mac app does not imply local shell access. Run the delegate in an execu
 ## Lifecycle and safety
 
 - One active delegate job per resolved working directory, across all delegate sessions. Use separate clones/worktrees for parallel jobs. This cannot detect writers outside the delegate or all overlapping parent/child directories.
-- Sessions and job snapshots are private durable JSON files. OMP transcripts live in each delegate session's `sessionDir`; Codex thread identity is stored privately there while native Codex history remains Codex-managed.
-- OMP completes only after session settlement, including resumed parent output. Codex completes on its owning `turn/completed`; this is not an OMP-style guarantee that detached child work has settled.
+- Sessions and job snapshots are private durable JSON files. OMP transcripts live in each delegate session's `sessionDir`; Codex thread identity and Kimi session identity are stored privately there while native provider history remains provider-managed.
+- OMP completes only after session settlement, including resumed parent output. Codex completes on its owning `turn/completed`; this is not an OMP-style guarantee that detached child work has settled. Kimi completes on its owning ACP prompt response.
 - After a crash, unfinished jobs are marked `interrupted` on restart. A graceful shutdown may let OMP report `aborted` first. Prompts are never silently replayed. Read the transcript and inspect actual work before resuming. Forced termination may leave OS descendants running; interruption and daemon shutdown are not a security kill switch.
 - The daemon listens only on `127.0.0.1`, authenticates every route with a private bearer token, and rejects browser Origin headers. Never port-forward it publicly. The CLI reads the token internally; do not print or share it. Logs/transcripts may contain project data and prompts.
 - CLI-to-daemon requests bypass HTTP proxy settings, keeping the local bearer token and task requests out of configured proxies. The OMP worker still inherits its environment, including proxy settings needed by its providers or tools.
@@ -184,7 +199,7 @@ Publish the source project, not its runtime state or a copy of your OMP home dir
 
 The `.gitignore` excludes common local environment files, credential/key files, logs, OMP-local state and Python caches. Ignore rules do not remove files already committed and do not prevent force-adding files. Review the staged files and scan the Git history before publishing; recheck after adding configuration, fixtures or logs.
 
-Provider credentials stay with each operator's OMP or Codex installation. That is not a guarantee that runtime output is secret-free: prompts, tool output and extensions can expose sensitive data if permitted. Review any transcript or diagnostic attachment before sharing it.
+Provider credentials stay with each operator's OMP, Codex, or Kimi installation. That is not a guarantee that runtime output is secret-free: prompts, tool output and extensions can expose sensitive data if permitted. Review any transcript or diagnostic attachment before sharing it.
 
 
 ## Development

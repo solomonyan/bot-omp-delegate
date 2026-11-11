@@ -13,11 +13,12 @@ import uuid
 
 from .worker import NoActiveTurn, Worker
 from .codex_worker import CodexWorker
+from .kimi_worker import KimiWorker
 from .notifications import Notifications
 
 TERMINAL = {"completed", "aborted", "error", "interrupted"}
 INPUT_METHODS = {"select", "confirm", "input", "editor", "ask"}
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 class Conflict(ValueError):
@@ -64,7 +65,7 @@ def validate_options(options):
     if options.get("approval_mode", "always-ask") not in {"always-ask", "always-ask-cached", "write", "yolo"}:
         raise ValueError("Unknown approval_mode")
     backend = options.get("backend", "omp")
-    if backend not in {"omp", "codex"}:
+    if backend not in {"omp", "codex", "kimi"}:
         raise ValueError("Unknown worker backend")
     if backend == "codex":
         for field in ("config", "tools", "profile"):
@@ -74,6 +75,15 @@ def validate_options(options):
             raise ValueError("Unknown Codex reasoning effort")
         if any(not Path(path).is_dir() for path in options.get("add_dir", [])):
             raise ValueError("Codex add_dir must contain directories")
+    if backend == "kimi":
+        for field in ("config", "tools", "profile"):
+            if options.get(field):
+                raise ValueError(f"{field} is not supported by the Kimi ACP backend; use Kimi's own configuration")
+        if options.get("thinking") is not None and options["thinking"] not in {"low", "high", "max"}:
+            raise ValueError("Unknown Kimi thinking effort")
+        if any(not Path(path).is_dir() for path in options.get("add_dir", [])):
+            raise ValueError("Kimi add_dir must contain directories")
+        return {**copy.deepcopy(options), "approval_mode": "yolo"}
     return copy.deepcopy(options)
 
 
@@ -102,7 +112,7 @@ class Store:
         path = self.root / "state.json"
         if path.exists():
             state = self._load(path, {})
-            if state.get("version") not in {1, STATE_VERSION}:
+            if state.get("version") not in {1, 2, STATE_VERSION}:
                 raise ValueError("Unsupported lifecycle state version")
             self.sessions = state["sessions"]
             self.lanes = state["lanes"]
@@ -326,7 +336,7 @@ class Store:
             if self.closing or session["worker"]["state"] == "closing":
                 raise Conflict("Worker startup cancelled")
             generation = uuid.uuid4().hex
-            worker_type = CodexWorker if session["options"].get("backend", "omp") == "codex" else Worker
+            worker_type = {"omp": Worker, "codex": CodexWorker, "kimi": KimiWorker}[session["options"].get("backend", "omp")]
             worker = worker_type(session["cwd"], session["sessionDir"], session["options"],
                                  lambda frame: self.event(sid, frame, generation))
             self.workers[sid] = worker
@@ -701,6 +711,8 @@ class Store:
                 backend = session["options"].get("backend", "omp")
                 if incoming.get("backend", backend) != backend:
                     raise Conflict("A conversation's backend cannot change; create a new session or lane")
+                if backend == "kimi" and incoming.get("add_dir", session["options"].get("add_dir", [])) != session["options"].get("add_dir", []):
+                    raise Conflict("Kimi workspace directories cannot change; create a new conversation")
                 options = validate_options({**session["options"], **incoming})
             if action == "open" and session["availability"] != "available":
                 raise Conflict("Session is archived")

@@ -327,7 +327,7 @@ class LifecycleBehaviorTests(unittest.TestCase):
         self.assertFalse((self.root / "purge.json").exists())
 
     def test_conversation_backend_cannot_be_changed_by_configure(self):
-        for backend, other in (("omp", "codex"), ("codex", "omp")):
+        for backend, other in (("omp", "codex"), ("codex", "omp"), ("kimi", "omp")):
             with self.subTest(backend=backend):
                 session = self.store.create({"name": backend, "cwd": str(self.cwd),
                                              "options": {"backend": backend, "model": "original"}})
@@ -370,7 +370,37 @@ class LifecycleBehaviorTests(unittest.TestCase):
         restored = restarted.show_session(session["id"])
         self.assertEqual(restored["backend"], "omp")
         self.assertEqual(restored["sessionDir"], session["sessionDir"])
-        self.assertEqual(json.loads(path.read_text())["version"], 2)
+        self.assertEqual(json.loads(path.read_text())["version"], 3)
+
+    def test_kimi_workspace_configuration_cannot_silently_change_on_resume(self):
+        extra = self.cwd / "extra"
+        extra.mkdir()
+        session = self.store.create({"name": "kimi", "cwd": str(self.cwd),
+                                     "options": {"backend": "kimi", "thinking": "low", "add_dir": [str(extra)]}})
+        with self.assertRaisesRegex(Conflict, "workspace directories cannot change"):
+            self.store.session_action(session["id"], "configure", {"options": {"add_dir": []}})
+        for invalid in ({"profile": "custom"}, {"config": [str(extra)]}, {"tools": "bash"}, {"thinking": "medium"}):
+            with self.subTest(options=invalid):
+                with self.assertRaises(ValueError):
+                    self.store.session_action(session["id"], "configure", {"options": invalid})
+        saved = self.store.show_session(session["id"])
+        self.assertEqual(saved["options"]["add_dir"], [str(extra)])
+        self.assertEqual(saved["options"]["thinking"], "low")
+
+    def test_version_two_state_preserves_codex_conversation_on_kimi_upgrade(self):
+        session = self.store.create({"name": "codex-v2", "cwd": str(self.cwd),
+                                     "options": {"backend": "codex"}})
+        identity = Path(session["sessionDir"]) / "codex-thread.json"
+        identity.write_text('{"version":1,"threadId":"retained-native-id","dispatchAttempted":true}')
+        path = self.root / "state.json"
+        state = json.loads(path.read_text())
+        state["version"] = 2
+        path.write_text(json.dumps(state))
+        restarted = Store(self.root)
+        self.addCleanup(restarted.close)
+        self.assertEqual(restarted.show_session(session["id"])["backend"], "codex")
+        self.assertEqual(json.loads(identity.read_text())["threadId"], "retained-native-id")
+        self.assertEqual(json.loads(path.read_text())["version"], 3)
 
 if __name__ == "__main__":
     unittest.main()

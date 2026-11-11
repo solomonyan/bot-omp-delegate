@@ -208,3 +208,5 @@ Provider credentials stay with each operator's OMP, Codex, or Kimi installation.
 python3 -m unittest discover -s tests -v
 ```
 
+After any delegate upgrade, run `scripts/smoke-skills.sh` to check that the omp, Codex, and Kimi backends resolve and can read the poteto-mode, interrogate, and setup-pstack skills.
+

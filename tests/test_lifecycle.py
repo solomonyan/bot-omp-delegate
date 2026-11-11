@@ -106,7 +106,7 @@ class LifecycleBehaviorTests(unittest.TestCase):
     def test_configure_merges_options_without_replacing_conversation(self):
         session = self.store.create({"name": "configured", "cwd": str(self.cwd), "options": {"model": "old"}})
         updated = self.store.session_action(session["id"], "configure", {"options": {"thinking": "high"}})
-        self.assertEqual(updated["options"], {"model": "old", "thinking": "high"})
+        self.assertEqual(updated["options"], {"model": "old", "thinking": "high", "approval_mode": "yolo"})
         self.assertEqual(updated["sessionDir"], session["sessionDir"])
 
 
@@ -346,7 +346,7 @@ class LifecycleBehaviorTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.store.session_action(session["id"], "configure", {"options": invalid})
                 self.assertEqual(self.store.show_session(session["id"])["options"],
-                                 {"backend": "codex", "thinking": "low"})
+                                 {"backend": "codex", "thinking": "low", "approval_mode": "yolo"})
 
     def test_codex_lane_keeps_backend_after_restart_and_new_conversation(self):
         lane = self.store.create_lane({"name": "codex", "cwd": str(self.cwd),
@@ -357,7 +357,7 @@ class LifecycleBehaviorTests(unittest.TestCase):
         self.assertEqual(replacement["backend"], "codex")
         self.assertNotEqual(replacement["sessionId"], lane["sessionId"])
         self.assertEqual(restarted.show_session(replacement["sessionId"])["options"],
-                         {"backend": "codex", "thinking": "low"})
+                         {"backend": "codex", "thinking": "low", "approval_mode": "yolo"})
 
     def test_version_one_state_keeps_existing_conversations_as_omp(self):
         session = self.store.create({"name": "legacy", "cwd": str(self.cwd)})

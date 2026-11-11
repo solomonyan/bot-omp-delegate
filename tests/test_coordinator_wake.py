@@ -147,16 +147,18 @@ class CoordinatorWakeTests(unittest.TestCase):
                              (status, "Stopped before completion", "Stopped before completion"))
         self.assertEqual(len(self.selected("run.error")), 3)
 
-    def test_monitoring_never_wakes_conversation_subscribers(self):
+    def test_stall_wakes_owner_while_deadline_and_daemon_up_stay_local(self):
         job = self.run_job()
         self.store.deadline(job["id"])
         self.now = 1800
         self.store.monitor_tick()
         self.store.notifications.emit("daemon.up")
         self.assertEqual([(p["event"], ids) for p, ids in self.enqueued],
-                         [("run.deadline", ["monitor"]), ("run.stalled", ["monitor"]),
-                          ("daemon.up", ["monitor"])])
+                         [("run.deadline", []), ("run.stalled", ["owner", "monitor"]), ("daemon.up", [])])
         self.assertTrue(all(p["channel"] == "monitor" for p, _ in self.enqueued))
+        logged = [json.loads(line) for line in (self.root / "logs" / "events-filtered.jsonl").read_text().splitlines()]
+        self.assertEqual([(e["event"], e["reason"]) for e in logged],
+                         [("run.deadline", "not_allowlisted"), ("daemon.up", "not_allowlisted")])
 
     def test_followup_uses_same_session_and_new_completion_identity(self):
         first = self.run_job()

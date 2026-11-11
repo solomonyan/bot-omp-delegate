@@ -3,8 +3,15 @@
 Runs every 3 min under launchd (com.solomon.lane-live). Per lane A/B/C: acts only if LIVE/<L>.live exists AND
 the lane has no activeJob. Runs lane_dispatch.py --dry-run and executes only its WOULD-RUN lines for live lanes.
 Verify: if LIVE/verify.live exists, runs lane_verify.py --dry-run and dispatches at most 1 new verify per tick,
-max MAX_VERIFY concurrent verify-* jobs. Logs every action to LIVE/events.log (HKT)."""
+max MAX_VERIFY concurrent verify-* jobs. Logs every action to LIVE/events.log (HKT).
+2026-11-11 autoverify gate (verify_gate.py): a PR head is auto-verified only when no live omp author job is on its
+branch AND active omp jobs are under the Mac cap (6; 4 at load1>=25; none at load1>=40). Skips log VERIFY-WAIT.
+Dry run: LANE_LIVE_DRY_RUN=1 runs the verify decision against live state, prints events to stdout, writes and
+dispatches nothing (LANE_LIVE_SIM_DONE=<job-id prefixes> treats those jobs as finished)."""
 import json, os, re, subprocess, sys, datetime as dt, glob
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import verify_gate
+DRY = os.environ.get("LANE_LIVE_DRY_RUN") == "1"
+SIM_DONE = tuple(x for x in os.environ.get("LANE_LIVE_SIM_DONE", "").split(",") if x) if DRY else ()
 HKT = dt.timezone(dt.timedelta(hours=8)); H = os.path.expanduser("~")
 LIVE = f"{H}/lanes/omp-runs/live"; BIN = f"{LIVE}/bin"; Q = f"{H}/lanes/omp-runs/queue"
 OMP = f"{H}/Workspace/bot-omp-delegate/scripts/omp-delegate"; REPO = f"{H}/Workspace/3d-ui-playground/wellness-ops"
@@ -13,6 +20,7 @@ MAX_VERIFY = int(os.environ.get("MAX_VERIFY", "2"))
 os.environ["PATH"] = f"{H}/Workspace/bot-omp-delegate/scripts:{H}/.local/bin:{H}/.bun/bin:/opt/homebrew/bin:" + os.environ["PATH"]
 now = dt.datetime.now(HKT); NOW = now.strftime("%Y-%m-%d %H:%M:%S HKT")
 def ev(msg):
+    if DRY: print(f"DRYRUN {NOW} {msg}"); return
     open(f"{LIVE}/events.log", "a").write(f"{NOW} {msg}\n")
 def sh(cmd, **k): return subprocess.run(cmd, capture_output=True, text=True, timeout=300, **k)
 def jl(p, d):
@@ -29,7 +37,7 @@ _FREE = _sh.disk_usage(H).free / 1e9
 _J = f"{H}/.omp-delegate/jobs"; _WARN = float(os.environ.get("JOB_LOG_WARN_GB", "5"))
 os.makedirs(f"{LIVE}/logcap", exist_ok=True)
 _gz_busy = subprocess.run(["pgrep", "-x", "gzip"], capture_output=True).returncode == 0
-for _p in glob.glob(f"{_J}/*.jsonl"):
+for _p in ([] if DRY else glob.glob(f"{_J}/*.jsonl")):
     try: _s = os.path.getsize(_p) / 1e9; _age = now.timestamp() - os.path.getmtime(_p)
     except OSError: continue
     _m = jl(_p[:-1], {}); _id = os.path.basename(_p)[:-6]; _stt = _m.get("status")
@@ -44,7 +52,7 @@ for _p in glob.glob(f"{_J}/*.jsonl"):
         _gz_busy = True; ev(f"LOG-GZ job {_id[:8]} {_s:.2f}GB idle {_age/3600:.1f}h: gzip started")
 if _FREE < _MIN_GB:
     ev(f"DISK-LOW free={_FREE:.1f}GB < {_MIN_GB:g}GB: dispatch refused (lane_live.py)")
-    open(f"{LIVE}/heartbeat", "w").write(NOW + "\n"); sys.exit(0)
+    DRY or open(f"{LIVE}/heartbeat", "w").write(NOW + "\n"); sys.exit(0)
 r = sh([OMP, "lane", "list"]); d = json.loads(r.stdout); lanes = d if isinstance(d, list) else d.get("lanes", d)
 byid = {l["id"]: l for l in lanes}
 ls = {"updated_at": now.isoformat(), "lanes": {}, "side_lanes": []}
@@ -57,13 +65,14 @@ for L, i in IDS.items():
 for l in lanes:
     if l["id"] in IDS.values(): continue
     ls["side_lanes"].append({"name": l["name"], "lane_id": l["id"], "state": "running" if l.get("activeJob") else "idle", "job_id": l.get("activeJob") or ""})
-json.dump(ls, open(f"{LIVE}/lane-status.mac.json", "w"), indent=1)
+LS = "/tmp/lane-status.dryrun.json" if DRY else f"{LIVE}/lane-status.mac.json"
+json.dump(ls, open(LS, "w"), indent=1)
 live = [L for L in IDS if os.path.exists(f"{LIVE}/{L}.live")]
 for L in live:
-    if ls["lanes"][L]["state"] == "idle" and not os.path.exists(f"{LIVE}/{L}.switched"):
+    if not DRY and ls["lanes"][L]["state"] == "idle" and not os.path.exists(f"{LIVE}/{L}.switched"):
         open(f"{LIVE}/{L}.switched", "w").write(NOW); ev(f"SWITCH Lane {L} now script-owned (idle_since {st['idle_since'][L]}, last job {st['last_job'].get(L,'?')[:8]})")
 # --- dispatch
-if any(ls["lanes"][L]["state"] == "idle" for L in live):
+if not DRY and any(ls["lanes"][L]["state"] == "idle" for L in live):
     r = sh(["python3", f"{BIN}/lane_dispatch.py", "--dry-run", "--lane-status", f"{LIVE}/lane-status.mac.json", "--flags", "/dev/null",
             "--queue-dir", Q, "--mac-queue-root", Q, "--drain-hold", "absent", "--lane-ids", ",".join(f"{k}={v}" for k, v in IDS.items())])
     out = r.stdout.splitlines()
@@ -78,13 +87,17 @@ if any(ls["lanes"][L]["state"] == "idle" for L in live):
         ev(f"DISPATCH Lane {L} {'OK' if ok else 'FAIL rc=%d' % res.returncode} prompt={rel} idle_since={idle} gap_min={gap} out={(res.stdout+res.stderr).strip()[-200:]!r}")
         if ok: st["idle_since"].pop(L, None)
 # --- verify
-if os.path.exists(f"{LIVE}/verify.live"):
+if DRY or os.path.exists(f"{LIVE}/verify.live"):
     running = [s for s in ls["side_lanes"] if s["name"].startswith("verify-") and s["state"] == "running"]
     env = dict(os.environ, FORCE_REVERIFY=",".join(x for x in os.environ.get("FORCE_REVERIFY", "450,454").split(",") if x and x not in st["forced_done"]))
-    r = sh(["python3", f"{BIN}/lane_verify.py", "--dry-run", "--lane-status", f"{LIVE}/lane-status.mac.json", "--prompt-root", f"{Q}/verify"], env=env)
+    r = sh(["python3", f"{BIN}/lane_verify.py", "--dry-run", "--lane-status", LS, "--prompt-root", f"{Q}/verify"], env=env)
     need = re.findall(r"^NEED #(\d+) (\S+)@([0-9a-f]{8}) draft=\S+ author=(.+?) verifier=(\S+) Check=", r.stdout, re.M)
     if r.returncode: ev(f"VERIFY-ERR lane_verify rc={r.returncode} {r.stderr.strip()[-200:]!r}")
     if need and len(running) >= MAX_VERIFY: need = []
+    if need:  # autoverify gate on the one head this tick would take: wait for the author's run.done and a free Mac job slot
+        ok, why = verify_gate.decide(need[0][1], verify_gate.load_jobs(_J, byid, SIM_DONE), os.getloadavg()[0])
+        if not ok or DRY: ev(f"{why} #{need[0][0]} {need[0][1]}@{need[0][2]}")
+        if not ok: need = []
     for num, branch, sha, author, vname in need[:1]:
         sh(["git", "-C", REPO, "fetch", "-q", "origin", branch])
         full = sh(["git", "-C", REPO, "rev-parse", "FETCH_HEAD"]).stdout.strip()
@@ -98,6 +111,7 @@ if os.path.exists(f"{LIVE}/verify.live"):
             ev(f"VERIFY-SKIP #{num} @{sha} already dispatched on this head"); continue
         if any(s["name"] == lane_name for s in ls["side_lanes"]) and num not in vh:
             vh[num] = sha; ev(f"VERIFY-SKIP #{num} {lane_name} already exists (seeded verified_heads)"); continue
+        if DRY: ev(f"VERIFY-DRYRUN would dispatch #{num} {branch}@{sha} verifier={vname} (nothing dispatched)"); break
         prev = [s for s in ls["side_lanes"] if s["name"].startswith(f"{vname}-")]
         if prev:
             lid = prev[-1]["lane_id"]
@@ -134,5 +148,6 @@ Finish with one line: VERDICT PASS|FAIL #{num} @{sha} patch-id <git patch-id of 
         if ok: vh[num] = sha
         if ok and num in ("450", "454"): st["forced_done"].append(num)
         ev(f"VERIFY #{num} {branch}@{sha} lane={lid} yolo label=omp-caller:friday {'OK' if ok else 'FAIL rc=%d' % res.returncode} running_verifies={len(running)} out={(res.stdout+res.stderr).strip()[-200:]!r}")
-json.dump(st, open(f"{LIVE}/state.json", "w"), indent=1)
-open(f"{LIVE}/heartbeat", "w").write(NOW + "\n")
+if not DRY:
+    json.dump(st, open(f"{LIVE}/state.json", "w"), indent=1)
+    open(f"{LIVE}/heartbeat", "w").write(NOW + "\n")

@@ -49,3 +49,44 @@ def load_jobs(jobs_dir, lanes_by_id, sim_done=()):
         br = "" if name.startswith("verify-") or status not in AUTHOR_LIVE else _branch(lane.get("cwd"))
         out.append({"id": jid, "status": status, "lane": name, "branch": br})
     return out
+
+
+# --- verifier model family (2026-11-11): the verifier must be a different model family from the author.
+KIMI, CLAUDE, CODEX = "kimi-code/k3.1-pro", "anthropic/claude-opus-4-6", "openai-codex/gpt-6.1-sol"
+FAMILY = {"openai-codex": "codex", "openai": "codex", "kimi-code": "kimi", "anthropic": "claude"}
+
+
+def family(model):
+    return FAMILY.get((model or "").split("/", 1)[0], "unknown")
+
+
+def verifier_for(author_model, kimi_ok=True):
+    """Pure. Codex/unknown author -> Kimi (Claude if Kimi is off); Kimi/Claude author -> Codex. Returns (model, family)."""
+    m = CODEX if family(author_model) in ("kimi", "claude") else KIMI if kimi_ok else CLAUDE
+    return m, family(m)
+
+
+def session_model(sid, sessions_dir, options=None):
+    """Pinned options.model, else provider/model of the last assistant message in the session's newest top-level
+    jsonl (a --model pin at worker start writes no model_change record), else the last model_change."""
+    if (options or {}).get("model"): return options["model"]
+    fs = sorted(glob.glob(f"{sessions_dir}/{sid}/*.jsonl"), key=os.path.getmtime) if sid else []
+    if not fs: return ""
+    r = subprocess.run(["grep", "-ho", '"provider":"[^"]*","model":"[^"]*"', fs[-1]], capture_output=True, text=True, timeout=60)
+    last = r.stdout.strip().splitlines()[-1:]
+    if last:
+        d = json.loads("{" + last[0] + "}"); return f"{d['provider']}/{d['model']}"
+    r = subprocess.run(["grep", "-h", '"type":"model_change"', fs[-1]], capture_output=True, text=True, timeout=60)
+    for line in reversed(r.stdout.splitlines()):
+        try: return json.loads(line).get("model") or ""
+        except Exception: continue
+    return ""
+
+
+def author_model(branch, lanes, sessions_dir):
+    """Model of the newest non-verify lane whose worktree is on `branch` ("" if none)."""
+    hits = [l for l in lanes if not (l.get("name") or "").startswith("verify-") and branch and _branch(l.get("cwd")) == branch]
+    for l in reversed(hits):
+        m = session_model(l.get("sessionId"), sessions_dir)
+        if m: return m
+    return ""

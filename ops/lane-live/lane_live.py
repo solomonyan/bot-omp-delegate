@@ -7,7 +7,9 @@ max MAX_VERIFY concurrent verify-* jobs. Logs every action to LIVE/events.log (H
 2026-11-11 autoverify gate (verify_gate.py): a PR head is auto-verified only when no live omp author job is on its
 branch AND active omp jobs are under the Mac cap (6; 4 at load1>=25; none at load1>=40). Skips log VERIFY-WAIT.
 Dry run: LANE_LIVE_DRY_RUN=1 runs the verify decision against live state, prints events to stdout, writes and
-dispatches nothing (LANE_LIVE_SIM_DONE=<job-id prefixes> treats those jobs as finished)."""
+dispatches nothing (LANE_LIVE_SIM_DONE=<job-id prefixes> treats those jobs as finished).
+2026-11-11 verifier family: each verify session is pinned (session configure --model) to a different family from the
+author's session model: Codex author -> kimi-code/k3.1-pro (Claude if LIVE/verifier-kimi.off exists), Kimi/Claude -> Codex."""
 import json, os, re, subprocess, sys, datetime as dt, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import verify_gate
 DRY = os.environ.get("LANE_LIVE_DRY_RUN") == "1"
@@ -111,6 +113,10 @@ if DRY or os.path.exists(f"{LIVE}/verify.live"):
             ev(f"VERIFY-SKIP #{num} @{sha} already dispatched on this head"); continue
         if any(s["name"] == lane_name for s in ls["side_lanes"]) and num not in vh:
             vh[num] = sha; ev(f"VERIFY-SKIP #{num} {lane_name} already exists (seeded verified_heads)"); continue
+        amodel = verify_gate.author_model(branch, lanes, f"{H}/.omp-delegate/sessions")
+        vmodel, vfam = verify_gate.verifier_for(amodel, kimi_ok=not os.path.exists(f"{LIVE}/verifier-kimi.off"))
+        afam = verify_gate.family(amodel)
+        if DRY: ev(f"VERIFY-DRYRUN author_model={amodel or '?'} ({afam}) verifier_model={vmodel} ({vfam})")
         if DRY: ev(f"VERIFY-DRYRUN would dispatch #{num} {branch}@{sha} verifier={vname} (nothing dispatched)"); break
         prev = [s for s in ls["side_lanes"] if s["name"].startswith(f"{vname}-")]
         if prev:
@@ -128,9 +134,11 @@ if DRY or os.path.exists(f"{LIVE}/verify.live"):
             except Exception: ev(f"VERIFY-FAIL #{num} lane create failed {cr.stderr.strip()[-200:]!r}"); break
             lj = json.loads(sh([OMP, "lane", "show", lid]).stdout or "{}")
         sid = lj.get("sessionId")
-        if sid: sh([OMP, "session", "configure", "--approval-mode", "yolo", sid])
-        mode = (json.loads(sh([OMP, "session", "show", sid]).stdout or "{}").get("options") or {}).get("approval_mode") if sid else None
+        if sid: sh([OMP, "session", "configure", "--approval-mode", "yolo", "--model", vmodel, sid])
+        opts = (json.loads(sh([OMP, "session", "show", sid]).stdout or "{}").get("options") or {}) if sid else {}
+        mode = opts.get("approval_mode")
         if mode != "yolo": ev(f"VERIFY-FAIL #{num} lane={lid} session={sid} approval_mode={mode} (refusing non-yolo verify)"); break
+        if opts.get("model") != vmodel or vfam == afam: ev(f"VERIFY-FAIL #{num} lane={lid} session={sid} model={opts.get('model')} author={amodel} (refusing same-family/unpinned verify)"); break
         # 2026-11-02 VISION: side lanes must notify MELCHIOR; no-op while the subscriber covers all lanes
         try:
             wr = sh([sys.executable, f"{BIN}/webhook_register.py", lane_name]).stdout.strip()
@@ -138,7 +146,8 @@ if DRY or os.path.exists(f"{LIVE}/verify.live"):
         except Exception as e: ev(f"WEBHOOK-REGISTER {lane_name} error {e!r}")
         os.makedirs(f"{Q}/verify", exist_ok=True); p = f"{Q}/verify/{name}-{sha}-prompt.md"
         open(p, "w").write(f"""Must-have: independent verify of #{num} at {sha}; verdict PASS|FAIL bound to {sha}
-You are an independent verifier (author lane: {author}). Worktree {wt} is detached at {full}. Do not edit product code, do not push, never force-push, never push to main, never print secrets.
+You are an independent verifier (author lane: {author}).
+Model family: you run on {vmodel} (family {vfam}); the author ran on {amodel or 'unknown'} (family {afam}). SIGNOFF.md must include the line "Verifier family: {vfam} ({vmodel}); author family: {afam} ({amodel or 'unknown'})". If your own model is not {vfam}, stop and report VERDICT FAIL (wrong verifier family). Worktree {wt} is detached at {full}. Do not edit product code, do not push, never force-push, never push to main, never print secrets.
 Review the diff vs origin/main, then run targeted tests for the touched packages (the full suite runs as the box Check; do not run it here).
 DB: No Docker on this Mac (Solomon, 10 Nov). Never run docker, open Docker Desktop, or pnpm verify:local, and do not start any real Postgres (Docker or Homebrew initdb/pg_ctl). Use PGLite only: pnpm check:static; env -u DATABASE_URL -u TEST_DATABASE_URL -u CI node --import tsx scripts/test-runner.ts (postgresql-engine tests skip by design); env -u DATABASE_URL pnpm db:check; the scripts/*-ui-smoke.ts smokes (already PGLite); pnpm build. pnpm check / pnpm test need TEST_DATABASE_URL: skip them and report that the real-PostgreSQL gate was not run locally (GitHub CI runs it). If a check truly needs real Postgres with no PGLite path, stop and report it instead.
 Finish with one line: VERDICT PASS|FAIL #{num} @{sha} patch-id <git patch-id of the diff> plus evidence. Post nothing to GitHub; the Eng Lead posts it.

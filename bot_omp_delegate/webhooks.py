@@ -22,12 +22,16 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-EVENTS = frozenset({"run.done", "run.error", "run.deadline", "run.needs_input", "run.stalled", "lane.idle", "daemon.up"})
+EVENTS = frozenset({"run.done", "run.error", "run.deadline", "run.needs_input", "run.stalled", "lane.idle", "daemon.up", "disk.low"})
 _SUBSCRIBER_FIELDS = {"id", "url", "auth_header", "auth_value", "events", "lanes", "hmac_secret", "signature_header", "mode"}
 _HEADER = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _RESERVED = {"content-type", "x-omp-delivery", "x-omp-event", "host", "content-length", "transfer-encoding", "connection", "trailer", "upgrade", "expect", "proxy-authorization"}
 CONVERSATIONAL = frozenset({"run.done", "run.error", "run.needs_input"})
+# The only events that may leave the Mac. Everything else is recorded in the
+# local filtered-events log instead (Solomon, 11 Nov 2026).
+DELIVERED = frozenset({"run.done", "run.error", "run.needs_input", "run.stalled"})
+FILTERED_LOG_MAX_BYTES = 1 << 20
 _IDENTIFIERS = frozenset({"id", "input_id", "event_id", "job_id", "session_id", "lane_id", "type", "method", "event", "channel"})
 
 
@@ -51,6 +55,14 @@ class ConfigError(ValueError):
 
 def _default():
     return {"version": 1, "stall_seconds": 1800, "idle_seconds": None, "subscribers": []}
+
+
+def _text(value):
+    return isinstance(value, str) and value.strip() and not any(ord(c) < 32 or ord(c) == 127 for c in value)
+
+
+def _caller_routes(value):
+    return isinstance(value, dict) and all(_text(k) and len(k) <= 200 and isinstance(v, str) and _ID.fullmatch(v) for k, v in value.items())
 
 
 def _invalid():
@@ -116,10 +128,12 @@ def _subscriber(item):
 
 
 def _config(raw):
-    if not isinstance(raw, dict) or set(raw) - {"version", "stall_seconds", "idle_seconds", "subscribers"} or type(raw.get("version")) is not int or raw["version"] != 1:
+    if not isinstance(raw, dict) or set(raw) - {"version", "stall_seconds", "idle_seconds", "subscribers", "caller_routes"} or type(raw.get("version")) is not int or raw["version"] != 1:
         raise _invalid()
     result = {**_default(), **raw}
     if not _duration(result["stall_seconds"]) or not _duration(result["idle_seconds"], True) or not isinstance(result["subscribers"], list):
+        raise _invalid()
+    if "caller_routes" in raw and not _caller_routes(raw["caller_routes"]):
         raise _invalid()
     result["subscribers"] = [_subscriber(s) for s in result["subscribers"]]
     if len({s["id"] for s in result["subscribers"]}) != len(result["subscribers"]):
@@ -350,37 +364,66 @@ class WebhookDispatcher:
             self._config, self._config_error = config, None
         return self.public_config()
 
+    def _safe_payload(self, payload):
+        if self._config_error:
+            raise _invalid()
+        secrets = sorted((s[k] for s in self._config["subscribers"] for k in ("url", "auth_value", "hmac_secret") if s.get(k)), key=len, reverse=True)
+        safe = _redact(dict(payload, version=1), secrets)
+        # Redact before truncation; otherwise a credential can straddle char 300.
+        # Only the bounded summary preview is truncated; full message/input are not.
+        safe["summary"] = str(safe.get("summary", ""))[:300]
+        # Event semantics, never payload text/channel overrides, select the route.
+        safe["channel"] = "conversation" if payload["event"] in CONVERSATIONAL else "monitor"
+        return safe
+
     def _prepare(self, payload, bypass_filters=False, coordinator_subscriber_id=None):
         with self._lock:
-            if self._config_error:
-                raise _invalid()
-            secrets = sorted((s[k] for s in self._config["subscribers"] for k in ("url", "auth_value", "hmac_secret") if s.get(k)), key=len, reverse=True)
-            safe = _redact(dict(payload, version=1), secrets)
-            # Redact before truncation; otherwise a credential can straddle char 300.
-            # Only the bounded summary preview is truncated; full message/input are not.
-            safe["summary"] = str(safe.get("summary", ""))[:300]
+            safe = self._safe_payload(payload)
             event = payload["event"]
-            # Event semantics, never payload text/channel overrides, select the route.
-            channel = "conversation" if event in CONVERSATIONAL else "monitor"
-            safe["channel"] = channel
+            subscribers = self._config["subscribers"]
             if bypass_filters:
-                subscribers = list(self._config["subscribers"])
-            elif channel == "conversation":
-                # Conversational events reach only the recorded owner, overriding
-                # that subscriber's filters; ownerless jobs never broadcast.
-                subscribers = [s for s in self._config["subscribers"]
-                               if coordinator_subscriber_id is not None and s["id"] == coordinator_subscriber_id]
-            else:
-                # Operational events use ordinary event/lane filters and never
-                # reach conversation-mode subscribers.
-                subscribers = [
-                    s for s in self._config["subscribers"]
-                    if s.get("mode", "monitor") == "monitor"
+                return _Envelope(safe), list(subscribers)
+            if event not in DELIVERED:
+                return _Envelope(safe), []
+            # The caller label's mapped subscriber owns the job's events, overriding
+            # that subscriber's own filters; an unmapped label (or a mapping to a
+            # removed subscriber) keeps the job's recorded coordinator. Ownerless
+            # jobs never broadcast.
+            by_id = {s["id"]: s for s in subscribers}
+            owner = self._config.get("caller_routes", {}).get(payload.get("label"))
+            if owner not in by_id:
+                owner = coordinator_subscriber_id
+            selected = [by_id[owner]] if owner in by_id else []
+            if safe["channel"] == "monitor":
+                selected += [
+                    s for s in subscribers
+                    if s["id"] != owner and s.get("mode", "monitor") == "monitor"
                     and (not s.get("events") or event in s["events"])
                     and (not s.get("lanes") or safe.get("lane") in s["lanes"]
                          or safe.get("lane_id") in s["lanes"])
                 ]
-            return _Envelope(safe), subscribers
+            return _Envelope(safe), selected
+
+    def record_filtered(self, payload, reason):
+        """Append a redacted summary of an event that will not be posted. Never raises."""
+        try:
+            with self._lock:
+                safe = self._safe_payload(payload)
+                entry = {key: safe.get(key) for key in ("ts", "event", "event_id", "job_id", "session_id", "lane", "label", "input_id", "status", "summary")}
+                entry.update(reason=reason, title=(safe.get("input") or {}).get("title"))
+                directory = self.root / "logs"
+                directory.mkdir(mode=0o700, exist_ok=True)
+                path = directory / "events-filtered.jsonl"
+                try:
+                    if path.stat().st_size >= FILTERED_LOG_MAX_BYTES:
+                        os.replace(path, directory / "events-filtered.jsonl.1")
+                except FileNotFoundError:
+                    pass
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            self._dropped += 1
 
     def _submit(self, envelope, subscribers, batch=None):
         with self._lock:
@@ -401,11 +444,36 @@ class WebhookDispatcher:
     def emit(self, payload, coordinator_subscriber_id=None):
         try:
             if self.enabled:
-                self._submit(*self._prepare(payload, coordinator_subscriber_id=coordinator_subscriber_id))
+                envelope, subscribers = self._prepare(payload, coordinator_subscriber_id=coordinator_subscriber_id)
+                self._submit(envelope, subscribers)
+                if not subscribers:
+                    self.record_filtered(payload, "no_route" if payload["event"] in DELIVERED else "not_allowlisted")
         except Exception:
             # Delivery is never allowed to alter a lane's state or expose exceptions.
             self._dropped += 1
 
+    def emit_disk_low(self, *, free_gb, threshold_gb, test=False):
+        for value, name in ((free_gb, "free_gb"), (threshold_gb, "threshold_gb")):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ConfigError(f"{name} must be a finite non-negative number")
+        if threshold_gb == 0 or (not test and free_gb >= threshold_gb):
+            raise ConfigError("disk.low requires free_gb below a positive threshold_gb")
+        payload = {
+            "event": "disk.low", "lane": "", "lane_id": "", "job_id": "", "status": "test" if test else "low",
+            "cwd": "", "branch": "", "last_commit_sha": "",
+            "summary": (f"Disk alert test: {free_gb:g} GB free (test)" if test else
+                        f"Disk space low: {free_gb:g} GB free (threshold {threshold_gb:g} GB)"),
+            "free_gb": free_gb, "threshold_gb": threshold_gb,
+            "ts": datetime.now(timezone.utc).isoformat(), "event_id": f"disk.low:{uuid.uuid4()}",
+        }
+        if test:
+            payload["test"] = True
+        envelope, subscribers = self._prepare(payload, bypass_filters=True)
+        target = next((s for s in subscribers if s["id"] == "jarvis-omp-events"), None)
+        if target is None:
+            raise ConfigError("Required disk.low webhook subscriber is not configured")
+        result = self._deliver(envelope, target)
+        return {"configured": 1, "delivered": int(result["delivered"]), "results": [result]}
     def test(self, event="daemon.up"):
         if not isinstance(event, str) or event not in EVENTS:
             raise ConfigError("Unknown webhook event")
@@ -434,7 +502,8 @@ class WebhookDispatcher:
             if attempt < len(self.retry_delays) and self._stop.wait(self.retry_delays[attempt]):
                 error = "stopped"
                 break
-        return {"subscriber_id": subscriber["id"], "delivered": success, "status_code": status, "attempts": attempts, "error": None if success else error}
+        return {"subscriber_id": subscriber["id"], "delivered": success, "status_code": status,
+                "request_id": delivery_id, "attempts": attempts, "error": None if success else error}
 
     def _worker(self):
         while not self._stop.is_set():

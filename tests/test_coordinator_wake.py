@@ -121,8 +121,6 @@ class CoordinatorWakeTests(unittest.TestCase):
                                       "options": [{"label": "Staging", "description": "No production writes"},
                                                   {"label": "Production"}], "recommended": 0}]}
             self.store.event(self.sid, request)
-            self.now += 30  # held for the needs_input grace, then forwarded still pending
-            self.store.monitor_tick()
             payload, ids = self.selected("run.needs_input")[-1]
             self.assertEqual(payload["input"], request)
             self.assertEqual(ids, ["owner"])
@@ -135,8 +133,6 @@ class CoordinatorWakeTests(unittest.TestCase):
                              ("effect", "Approve production deployment?")):
             self.store.event(self.sid, {"type": "extension_ui_request", "method": "confirm",
                                         "id": ui_id, "title": title})
-        self.now = 30
-        self.store.monitor_tick()
         self.assertEqual([p["input_id"] for p, _ in self.selected("run.needs_input")],
                          ["routine", "effect"])
 

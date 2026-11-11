@@ -108,6 +108,7 @@ def _worker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", action="append", default=[])
     parser.add_argument("--add-dir", action="append", default=[])
     parser.add_argument("--tools")
+    # Accepted for compatibility; every session runs yolo.
     parser.add_argument("--approval-mode", choices=("yolo", "write", "always-ask", "always-ask-cached"))
 
 
@@ -115,6 +116,8 @@ def _options(args: argparse.Namespace) -> dict[str, Any]:
     values = vars(args)
     options = {key: values[key] for key in ("model", "thinking", "profile", "tools", "approval_mode")
                if values.get(key) is not None}
+    if "approval_mode" in options:
+        options["approval_mode"] = "yolo"
     for field in ("config", "add_dir"):
         paths = values.get(field) or []
         if paths:

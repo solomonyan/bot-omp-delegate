@@ -8,7 +8,7 @@ Generic integration: each operator uses their own OMP installation, login, confi
 
 Webhooks are best-effort asynchronous notifications, not a durable queue. Configure subscribers in the private `webhooks.json` under the delegate state directory; protect endpoint/auth/HMAC values and send only to trusted receivers. `events` and `lanes` filter operational notifications. Subscriber `mode` is `conversation` or `monitor` and defaults to `monitor` for existing observer compatibility.
 
-Only `run.done`, `run.error`, `run.needs_input` and `run.stalled` are ever posted. Each goes to the subscriber that the job's label maps to in `caller_routes`, or, for an unmapped label, to the job's recorded `coordinator_subscriber_id`; owner selection overrides that subscriber's event/lane filters. `run.stalled` also reaches `monitor` subscribers whose filters match. Ownerless jobs remain available through `read`/`wait` and produce no webhook. Every other event (`run.deadline`, `lane.idle`, `daemon.up`), every unrouted event, every prompt answered within the needs-input grace and every pre-approved tool prompt is appended only to the private local log `<state-dir>/logs/events-filtered.jsonl` (redacted, `0600`, rotated to `.1` at 1 MiB). Notifications do not invoke a model. The daemon answers `Allow tool: <name>` prompts itself, with the one-time approve option, only for tools listed in `tool_preapprovals` for sessions whose cwd is under that rule's `cwd_root` (default: `browser` under `~/lanes/omp-runs/design/`).
+Only `run.done`, `run.error`, `run.needs_input` and `run.stalled` are ever posted. Each goes to the subscriber that the job's label maps to in `caller_routes`, or, for an unmapped label, to the job's recorded `coordinator_subscriber_id`; owner selection overrides that subscriber's event/lane filters. `run.stalled` also reaches `monitor` subscribers whose filters match. Ownerless jobs remain available through `read`/`wait` and produce no webhook. Every other event (`run.deadline`, `lane.idle`, `daemon.up`) and every unrouted event is appended only to the private local log `<state-dir>/logs/events-filtered.jsonl` (redacted, `0600`, rotated to `.1` at 1 MiB). Notifications do not invoke a model.
 
 Version 1 payloads include `channel` (`conversation` or `monitor`), `session_id`, `job_id`, and stable business `event_id`; terminal responses carry the full `message`, and questions carry `input_id` plus the full input request. The bounded `summary` is a diagnostic preview, not the response. Configured endpoint/auth/HMAC values are recursively redacted from user-visible string values, not structural keys or identifiers. `X-OMP-Delivery` remains stable across HTTP retries. Receivers should deduplicate by `event_id` before invoking Grok; HTTP delivery is best-effort and is not exactly-once. Verify configured HMAC signatures against raw request bytes before parsing.
 
@@ -39,10 +39,8 @@ Optional ticket-file dispatch uses `omp-dispatch LANE_ID /path/to/ticket.txt [ma
 The ticket must contain a non-empty `Must-have:` line. Set
 `OMP_COORDINATOR_SUBSCRIBER_ID` to the job's webhook owner; `--caller NAME` adds
 a caller label, and `--dry-run` previews the detached submission without dispatching.
-The wrapper uses the sibling `omp-delegate` executable and preserves the session's
-approval policy, including explicit `yolo`/`write` or inherited OMP defaults.
-Change that policy with `omp-delegate session configure SESSION_ID --approval-mode yolo`
-only when intended and the session is idle. Subscriber discovery and local monitoring
+The wrapper uses the sibling `omp-delegate` executable and never changes the session's
+approval mode. Subscriber discovery and local monitoring
 belong in private adapters, not this shared dispatcher.
 
 ## Use with an existing project
@@ -128,7 +126,9 @@ Environment variables:
 
 ## Approvals and questions
 
-Workers inherit OMP's configured approval policy unless `approval_mode` is explicitly supplied. Existing explicit modes, including `write` and `yolo`, retain their meaning. Approval mediation is not an OS sandbox: OMP and its tools remain subject to the OS user's access. Never suppress an unresolved approval or grant permission on the coordinator's behalf.
+approval mode is always yolo; the daemon enforces it.
+
+Every worker starts with `--approval-mode yolo`. `approval_mode` is still accepted on `session create`/`configure` and the CLI for compatibility, but any value is stored as `yolo`; a non-yolo request writes one line to the daemon's stderr log and sends no webhook. Approval mediation is not an OS sandbox: OMP and its tools remain subject to the OS user's access. Never suppress an unresolved approval or grant permission on the coordinator's behalf.
 
 A job with a pending request reports `status: waiting_input` and `pendingInput`. Conversational webhook delivery includes the full question request and `input_id`; Grok answers through the existing control path only after resolving the request under the owner's policy:
 

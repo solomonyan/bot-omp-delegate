@@ -4,15 +4,21 @@ Load this reference for webhook configuration/receivers, session retention/confi
 
 ## Backend configuration
 
-Choose `--backend omp|codex` on `lane create` or `session create`; omission selects OMP. Backend selection is stored in `options.backend`. `session configure` may change supported worker options while settled, but cannot switch backend; create a new conversation to use another backend. OMP and Codex native conversation histories are not interchangeable.
+Choose `--backend omp|codex|kimi` on `lane create` or `session create`; omission selects OMP. Backend selection is stored in `options.backend`. `session configure` may change supported worker options while settled, but cannot switch backend; create a new conversation to use another backend. OMP, Codex, and Kimi native histories are not interchangeable.
 
 Codex requires an installed, authenticated Codex CLI and uses its persistent headless `codex app-server`, not `codex exec`. Set `OMP_DELEGATE_CODEX` to override the executable. Codex resumes its saved native thread after daemon restart without replaying the task. The thread ID is private delegate session state; purging delegate data does not purge Codex history.
 
 Codex supports `--model`, `--thinking` as turn effort, and repeated `--add-dir` as writable roots. It rejects `--config` file overlays, `--tools`, and `--profile`: the installed Codex app-server does not accept named profiles. Native Codex configuration and inherited environment remain authoritative. With no explicit approval mode, no permission override is sent. Explicit modes are approximate, not equivalent: `yolo` maps to `never` plus `danger-full-access`; `write` and `always-ask-cached` to `on-request` plus `workspace-write`; `always-ask` to `untrusted` plus `workspace-write`.
 
-Both backends share worktree exclusion and the detached submission, owner-routed webhook, answer, and same-session follow-up workflow. Codex is not feature-equivalent to OMP's native child controls or completion behavior. OMP `agent list/read/steer/cancel` and native parent continuation are OMP-specific; Codex must reject unavailable child-control operations rather than report fabricated results.
+Kimi requires installed, authenticated Kimi Code CLI 2.5.3 and uses persistent `kimi acp`. Set `OMP_DELEGATE_KIMI` to override the executable. The worker inherits the operator's Kimi environment, `KIMI_CODE_HOME`, login, configuration, skills, and target-project instructions; credentials are not copied. A private session identity lets it resume the native Kimi conversation after daemon restart without replaying prompts. Deleting delegate state does not purge Kimi-managed native history.
 
-Only command/file approvals and `requestUserInput` questions are mediated. Other native server requests, including unsupported permission/MCP elicitation requests, receive explicit errors rather than implicit grants. Prewarm-only native threads may be recreated because Codex has no persisted rollout yet; after any dispatch attempt, failed resumption is an error and never a reset or task replay.
+Kimi supports native model aliases through `--model`, `--thinking low|high|max`, and repeated `--add-dir` roots at native session creation. It rejects `--config`, `--profile`, and `--tools`; Kimi roots cannot be changed by session configure, so create a new conversation to change them. The daemon enforces `approval_mode: yolo` at every startup/resume through ACP `session/set_config_option` mode `yolo`, meaning auto-approve everything. Do not use global CLI flags as a substitute; the ACP session mode is the enforced policy.
+
+The detached-submit, owner-routed webhook, question/answer, and same-session follow-up workflow is shared. Conversation events (`run.done`, `run.error`, `run.needs_input`) go to the recorded coordinator subscriber; operational events remain monitor-only. Adding Kimi does not change delivery routing.
+
+Codex and Kimi are not feature-equivalent to OMP's native child controls or completion behavior. OMP `agent list/read/steer/cancel` and native parent continuation are OMP-specific. Kimi explicitly rejects steer (ACP has no safe mid-turn steer), manual compact (the advertised command is only an explanatory notice), and direct child controls. Do not send a second prompt as a steer, fake compact success, or invent child results. Native automatic context management remains Kimi-owned.
+
+Kimi permission `select` requests expose the full native options. Answer with the exact native `optionId` in `value`, not the label; never implicitly choose `allow_always`. A `confirmed` boolean is accepted only when exactly one `allow_once` or `reject_once` choice maps unambiguously to it. Elicitation is surfaced as `ask`: provide every required question ID in `answers`, with exact `selectedOptions` values for choices/multi-select or `text` for free-text fields. A `value` object keyed by form field IDs is also accepted. Invalid or partial answers remain pending; unknown native requests fail explicitly.
 
 ## Questions and approvals
 
@@ -23,7 +29,7 @@ omp-delegate answer JOB_ID --json '{"id":"UI_ID","confirmed":false}'
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","answers":[{"id":"QUESTION_ID","selectedOptions":["EXACT LABEL"]}]}'
 ```
 
-Do not suppress unresolved approval dialogs. Each backend's permission policy remains authoritative.
+Do not suppress unresolved approval dialogs. OMP's configured native permission policy remains authoritative; Codex and Kimi requests use their native response workflows.
 
 ## Session lifecycle
 

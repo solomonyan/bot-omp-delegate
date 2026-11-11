@@ -28,6 +28,10 @@ _HEADER = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _RESERVED = {"content-type", "x-omp-delivery", "x-omp-event", "host", "content-length", "transfer-encoding", "connection", "trailer", "upgrade", "expect", "proxy-authorization"}
 CONVERSATIONAL = frozenset({"run.done", "run.error", "run.needs_input"})
+# The only events that may leave the Mac. Everything else is recorded in the
+# local filtered-events log instead (Solomon, 11 Nov 2026).
+DELIVERED = frozenset({"run.done", "run.error", "run.needs_input", "run.stalled"})
+FILTERED_LOG_MAX_BYTES = 1 << 20
 _IDENTIFIERS = frozenset({"id", "input_id", "event_id", "job_id", "session_id", "lane_id", "type", "method", "event", "channel"})
 
 
@@ -49,13 +53,14 @@ class ConfigError(ValueError):
     """Only static, non-secret diagnostics may be passed here."""
 
 
-# Tool-approval prompts in these roots are usually cleared by a scoped
-# approver within one poll (20 s), so run.needs_input is held for a grace
-# period and dropped if answered first. grace 0 restores immediate delivery.
+# Prompts are usually cleared by a scoped approver within one poll (20 s), so
+# run.needs_input is held for a grace period and dropped if answered first.
+# grace 0 restores immediate delivery.
 DEFAULT_NEEDS_INPUT_GRACE_SECONDS = 30
-DEFAULT_NEEDS_INPUT_GRACE_ROOTS = ("~/lanes/omp-runs/design/launch-2026-11-11/",)
 GRACE_SECONDS_ENV = "OMP_DELEGATE_NEEDS_INPUT_GRACE_SECONDS"
-GRACE_ROOTS_ENV = "OMP_DELEGATE_NEEDS_INPUT_GRACE_ROOTS"
+# KAREN's design sessions use the browser tool constantly; its prompt is
+# answered by the daemon instead of waking anyone.
+DEFAULT_TOOL_PREAPPROVALS = ({"cwd_root": "~/lanes/omp-runs/design/", "tools": ["browser"]},)
 
 
 def _default():
@@ -66,15 +71,26 @@ def _grace_seconds(value):
     return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 600
 
 
-def _grace_roots(value):
-    return isinstance(value, list) and all(isinstance(v, str) and v.strip() and not any(ord(c) < 32 for c in v) for v in value)
+def _text(value):
+    return isinstance(value, str) and value.strip() and not any(ord(c) < 32 or ord(c) == 127 for c in value)
+
+
+def _caller_routes(value):
+    return isinstance(value, dict) and all(_text(k) and len(k) <= 200 and isinstance(v, str) and _ID.fullmatch(v) for k, v in value.items())
+
+
+def _tool_preapprovals(value):
+    return isinstance(value, list) and all(
+        isinstance(rule, dict) and set(rule) == {"cwd_root", "tools"} and _text(rule["cwd_root"])
+        and os.path.isabs(os.path.expanduser(rule["cwd_root"]))
+        and isinstance(rule["tools"], list) and rule["tools"] and all(isinstance(t, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", t) for t in rule["tools"])
+        for rule in value)
 
 
 def needs_input_grace(config, environ=None):
-    """Effective (seconds, roots). Env overrides config; invalid env is ignored."""
+    """Effective grace seconds. Env overrides config; invalid env is ignored."""
     environ = os.environ if environ is None else environ
     seconds = config.get("needs_input_grace_seconds", DEFAULT_NEEDS_INPUT_GRACE_SECONDS)
-    roots = config.get("needs_input_grace_roots", list(DEFAULT_NEEDS_INPUT_GRACE_ROOTS))
     raw = environ.get(GRACE_SECONDS_ENV)
     if raw is not None:
         try:
@@ -83,11 +99,13 @@ def needs_input_grace(config, environ=None):
                 seconds = value
         except ValueError:
             pass
-    raw = environ.get(GRACE_ROOTS_ENV)
-    if raw is not None:
-        roots = [r for r in raw.split(os.pathsep) if r.strip()]
-    resolved = tuple(os.path.realpath(os.path.expanduser(r)) for r in roots)
-    return seconds, resolved
+    return seconds
+
+
+def tool_preapprovals(config):
+    """((resolved cwd root, frozenset of tool names), ...) the daemon answers itself."""
+    rules = config.get("tool_preapprovals", list(DEFAULT_TOOL_PREAPPROVALS))
+    return tuple((os.path.realpath(os.path.expanduser(r["cwd_root"])), frozenset(r["tools"])) for r in rules)
 
 
 def _invalid():
@@ -153,14 +171,16 @@ def _subscriber(item):
 
 
 def _config(raw):
-    if not isinstance(raw, dict) or set(raw) - {"version", "stall_seconds", "idle_seconds", "subscribers", "needs_input_grace_seconds", "needs_input_grace_roots"} or type(raw.get("version")) is not int or raw["version"] != 1:
+    if not isinstance(raw, dict) or set(raw) - {"version", "stall_seconds", "idle_seconds", "subscribers", "needs_input_grace_seconds", "caller_routes", "tool_preapprovals"} or type(raw.get("version")) is not int or raw["version"] != 1:
         raise _invalid()
     result = {**_default(), **raw}
     if not _duration(result["stall_seconds"]) or not _duration(result["idle_seconds"], True) or not isinstance(result["subscribers"], list):
         raise _invalid()
     if "needs_input_grace_seconds" in raw and not _grace_seconds(raw["needs_input_grace_seconds"]):
         raise _invalid()
-    if "needs_input_grace_roots" in raw and not _grace_roots(raw["needs_input_grace_roots"]):
+    if "caller_routes" in raw and not _caller_routes(raw["caller_routes"]):
+        raise _invalid()
+    if "tool_preapprovals" in raw and not _tool_preapprovals(raw["tool_preapprovals"]):
         raise _invalid()
     result["subscribers"] = [_subscriber(s) for s in result["subscribers"]]
     if len({s["id"] for s in result["subscribers"]}) != len(result["subscribers"]):
@@ -376,9 +396,9 @@ class WebhookDispatcher:
     @property
     def settings(self):
         with self._lock:
-            seconds, roots = needs_input_grace(self._config)
             return {"stall_seconds": self._config["stall_seconds"], "idle_seconds": self._config["idle_seconds"],
-                    "needs_input_grace_seconds": seconds, "needs_input_grace_roots": roots}
+                    "needs_input_grace_seconds": needs_input_grace(self._config),
+                    "tool_preapprovals": tool_preapprovals(self._config)}
 
     def public_config(self):
         with self._lock:
@@ -393,37 +413,66 @@ class WebhookDispatcher:
             self._config, self._config_error = config, None
         return self.public_config()
 
+    def _safe_payload(self, payload):
+        if self._config_error:
+            raise _invalid()
+        secrets = sorted((s[k] for s in self._config["subscribers"] for k in ("url", "auth_value", "hmac_secret") if s.get(k)), key=len, reverse=True)
+        safe = _redact(dict(payload, version=1), secrets)
+        # Redact before truncation; otherwise a credential can straddle char 300.
+        # Only the bounded summary preview is truncated; full message/input are not.
+        safe["summary"] = str(safe.get("summary", ""))[:300]
+        # Event semantics, never payload text/channel overrides, select the route.
+        safe["channel"] = "conversation" if payload["event"] in CONVERSATIONAL else "monitor"
+        return safe
+
     def _prepare(self, payload, bypass_filters=False, coordinator_subscriber_id=None):
         with self._lock:
-            if self._config_error:
-                raise _invalid()
-            secrets = sorted((s[k] for s in self._config["subscribers"] for k in ("url", "auth_value", "hmac_secret") if s.get(k)), key=len, reverse=True)
-            safe = _redact(dict(payload, version=1), secrets)
-            # Redact before truncation; otherwise a credential can straddle char 300.
-            # Only the bounded summary preview is truncated; full message/input are not.
-            safe["summary"] = str(safe.get("summary", ""))[:300]
+            safe = self._safe_payload(payload)
             event = payload["event"]
-            # Event semantics, never payload text/channel overrides, select the route.
-            channel = "conversation" if event in CONVERSATIONAL else "monitor"
-            safe["channel"] = channel
+            subscribers = self._config["subscribers"]
             if bypass_filters:
-                subscribers = list(self._config["subscribers"])
-            elif channel == "conversation":
-                # Conversational events reach only the recorded owner, overriding
-                # that subscriber's filters; ownerless jobs never broadcast.
-                subscribers = [s for s in self._config["subscribers"]
-                               if coordinator_subscriber_id is not None and s["id"] == coordinator_subscriber_id]
-            else:
-                # Operational events use ordinary event/lane filters and never
-                # reach conversation-mode subscribers.
-                subscribers = [
-                    s for s in self._config["subscribers"]
-                    if s.get("mode", "monitor") == "monitor"
+                return _Envelope(safe), list(subscribers)
+            if event not in DELIVERED:
+                return _Envelope(safe), []
+            # The caller label's mapped subscriber owns the job's events, overriding
+            # that subscriber's own filters; an unmapped label (or a mapping to a
+            # removed subscriber) keeps the job's recorded coordinator. Ownerless
+            # jobs never broadcast.
+            by_id = {s["id"]: s for s in subscribers}
+            owner = self._config.get("caller_routes", {}).get(payload.get("label"))
+            if owner not in by_id:
+                owner = coordinator_subscriber_id
+            selected = [by_id[owner]] if owner in by_id else []
+            if safe["channel"] == "monitor":
+                selected += [
+                    s for s in subscribers
+                    if s["id"] != owner and s.get("mode", "monitor") == "monitor"
                     and (not s.get("events") or event in s["events"])
                     and (not s.get("lanes") or safe.get("lane") in s["lanes"]
                          or safe.get("lane_id") in s["lanes"])
                 ]
-            return _Envelope(safe), subscribers
+            return _Envelope(safe), selected
+
+    def record_filtered(self, payload, reason):
+        """Append a redacted summary of an event that will not be posted. Never raises."""
+        try:
+            with self._lock:
+                safe = self._safe_payload(payload)
+                entry = {key: safe.get(key) for key in ("ts", "event", "event_id", "job_id", "session_id", "lane", "label", "input_id", "status", "summary")}
+                entry.update(reason=reason, title=(safe.get("input") or {}).get("title"))
+                directory = self.root / "logs"
+                directory.mkdir(mode=0o700, exist_ok=True)
+                path = directory / "events-filtered.jsonl"
+                try:
+                    if path.stat().st_size >= FILTERED_LOG_MAX_BYTES:
+                        os.replace(path, directory / "events-filtered.jsonl.1")
+                except FileNotFoundError:
+                    pass
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            self._dropped += 1
 
     def _submit(self, envelope, subscribers, batch=None):
         with self._lock:
@@ -444,7 +493,10 @@ class WebhookDispatcher:
     def emit(self, payload, coordinator_subscriber_id=None):
         try:
             if self.enabled:
-                self._submit(*self._prepare(payload, coordinator_subscriber_id=coordinator_subscriber_id))
+                envelope, subscribers = self._prepare(payload, coordinator_subscriber_id=coordinator_subscriber_id)
+                self._submit(envelope, subscribers)
+                if not subscribers:
+                    self.record_filtered(payload, "no_route" if payload["event"] in DELIVERED else "not_allowlisted")
         except Exception:
             # Delivery is never allowed to alter a lane's state or expose exceptions.
             self._dropped += 1

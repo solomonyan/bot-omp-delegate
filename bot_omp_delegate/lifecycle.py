@@ -480,9 +480,12 @@ class Store:
                     changed = True
             if kind == "extension_ui_request":
                 if frame.get("method") in INPUT_METHODS:
+                    approve = self.notifications.preapproval(frame, session)
+                    if approve is not None and self._answer_preapproved(sid, frame["id"], approve):
+                        self.notifications.preapproved(job, session, self._lane_for_session(sid), frame)
                     # RPC dialogs are real caller decisions, not progress events.
                     # Replayed frames must not create duplicate pending questions.
-                    if not any(p["id"] == frame["id"] for p in job["pendingInput"]):
+                    elif not any(p["id"] == frame["id"] for p in job["pendingInput"]):
                         job["pendingInput"].append(frame)
                 elif frame.get("method") == "cancel":
                     job["pendingInput"] = [p for p in job["pendingInput"] if p["id"] != frame.get("targetId")]
@@ -518,6 +521,14 @@ class Store:
             if changed:
                 self._save_job(job)
             self.cv.notify_all()
+
+    def _answer_preapproved(self, sid, ui_id, value):
+        worker = self.workers.get(sid)
+        try:
+            worker.respond_ui({"id": ui_id, "value": value})
+            return True
+        except Exception:
+            return False  # an unanswerable prompt stays pending for a person
 
     def _result(self, job):
         error = job.get("resultError")

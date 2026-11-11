@@ -67,6 +67,8 @@ Version 1 notifications include `channel` (`conversation` or `monitor`), `sessio
 
 Configuration lives at `<state-dir>/webhooks.json` (default state directory `~/.omp-delegate`, overridden by global `--state-dir`). An absent file uses version 1 defaults: `stall_seconds: 1800`, `idle_seconds: null`, and no subscribers. Timer values are configured in the private JSON file, not through subscriber commands. The file must be a regular, owner-owned `0600` file; symlinks and insecure permissions are rejected. Writes are atomic under the private state root.
 
+Optional `needs_input_grace_seconds` (0-600, default 30) and `needs_input_grace_roots` (list of paths, default `["~/lanes/omp-runs/design/launch-2026-11-11/"]`) delay `run.needs_input` for OMP tool-approval prompts in sessions under those roots, so a scoped auto-approver can answer first. A prompt answered, cancelled or superseded by job completion within the grace is never sent; one still pending is sent once, unchanged. Questions that are not tool approvals, sessions outside the roots, and all other events are sent immediately. The environment variables `OMP_DELEGATE_NEEDS_INPUT_GRACE_SECONDS` and `OMP_DELEGATE_NEEDS_INPUT_GRACE_ROOTS` (path-separator list) override the file; `0` is the kill switch. Older daemons reject these keys, so add them to `webhooks.json` only after upgrading.
+
 The schema is:
 
 ```json

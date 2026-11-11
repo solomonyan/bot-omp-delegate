@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Hold `run.needs_input` for tool-approval prompts (`select` titled `Allow tool: ...` with an approve option) whose session cwd is under `needs_input_grace_roots` (default `~/lanes/omp-runs/design/launch-2026-11-11/`) for `needs_input_grace_seconds` (default 30). Drop it if the prompt is answered, cancelled or the job ends first; otherwise forward it once, unchanged. Real questions, other roots and every other event stay immediate. `0` (or `OMP_DELEGATE_NEEDS_INPUT_GRACE_SECONDS=0`) restores immediate delivery; shutdown forwards anything still held.
 - Add a versioned `omp-dispatch` ticket wrapper that preserves session approval settings instead of reconfiguring permissions before every job. Keep machine-specific subscriber discovery and monitoring in private local adapters.
 - Route conversational notifications (`run.done`, `run.error`, `run.needs_input`) only to the recorded coordinator subscriber; add conversation/monitor modes, full response/input payloads, stable event identity, and event-based receiver deduplication guidance. Operational events remain monitor-only.
 - Grok's conversational workflow uses one detached job and its owner-routed webhook; questions use the existing answer path, and follow-up continues in the same session. OMP approval configuration is inherited unless an explicit mode is selected.

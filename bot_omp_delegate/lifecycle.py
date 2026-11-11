@@ -915,6 +915,11 @@ class Store:
 
     def close(self):
         with self.cv:
+            # Shutdown cannot wait out a grace period: forward still-pending held prompts now.
+            try:
+                self.notifications.release_held(self.jobs, force=True)
+            except Exception:
+                self.notifications.failures += 1
             self.closing = True
             self._monitor_stop.set()
             self._monitor_wake.set()

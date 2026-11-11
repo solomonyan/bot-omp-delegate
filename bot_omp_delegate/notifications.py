@@ -3,7 +3,35 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import copy
+import os
 import time
+
+TERMINAL = frozenset({"completed", "error", "aborted", "interrupted"})
+
+
+def is_tool_approval(request):
+    """OMP's per-tool permission dialog: select titled "Allow tool: ..." with an approve option."""
+    if not isinstance(request, dict) or request.get("method") != "select":
+        return False
+    title = request.get("title")
+    if not isinstance(title, str) or not title.startswith("Allow tool:"):
+        return False
+    labels = [o if isinstance(o, str) else (o.get("label") or o.get("value") or "") if isinstance(o, dict) else ""
+              for o in request.get("options") or []]
+    return any(isinstance(label, str) and label.lower().startswith(("approve", "allow")) for label in labels)
+
+
+def under_roots(cwd, roots):
+    if not isinstance(cwd, str) or not cwd or not roots:
+        return False
+    path = os.path.realpath(os.path.expanduser(cwd))
+    for root in roots:
+        try:
+            if os.path.commonpath([path, root]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 class Notifications:
@@ -63,7 +91,8 @@ class Notifications:
     def _run(self, job):
         state = self.runs.get(job["id"])
         if state is None:
-            state = {"last_output": self.clock(), "stalled": False, "waiting": False, "input_ids": set()}
+            # held: input id -> (deadline, request, session, lane) for grace-delayed approvals.
+            state = {"last_output": self.clock(), "stalled": False, "waiting": False, "input_ids": set(), "held": {}}
             self.runs[job["id"]] = state
         return state
 
@@ -110,7 +139,42 @@ class Notifications:
             questions = request.get("questions")
             first = questions[0] if isinstance(questions, list) and questions and isinstance(questions[0], dict) else {}
             summary = request.get("title") or first.get("question") or "Question or approval requires input"
+            grace = self._grace(request, session)
+            if grace:
+                state["held"][ui_id] = (self.clock() + grace, request, session, lane, summary)
+                continue
             self.emit("run.needs_input", job, session, lane, summary, input_request=request)
+
+    def _grace(self, request, session):
+        """Seconds to hold this prompt, or 0 to forward now (real questions, other roots, kill switch)."""
+        try:
+            settings = getattr(self.dispatcher, "settings", None) or {}
+            seconds = settings.get("needs_input_grace_seconds") or 0
+            if seconds <= 0 or not is_tool_approval(request):
+                return 0
+            return seconds if under_roots((session or {}).get("cwd"), settings.get("needs_input_grace_roots") or ()) else 0
+        except Exception:
+            return 0  # any doubt forwards immediately, as before this feature
+
+    def release_held(self, jobs, force=False):
+        """Forward held prompts still pending at their deadline (or now, if force); drop resolved ones.
+
+        Bounded enqueue only; the caller may hold Store.cv.
+        """
+        now = self.clock()
+        for jid, state in list(self.runs.items()):
+            held = state.get("held")
+            if not held:
+                continue
+            job = jobs.get(jid)
+            pending = {p.get("id") for p in (job or {}).get("pendingInput") or []}
+            for ui_id, (deadline, request, session, lane, summary) in list(held.items()):
+                if job is None or job.get("status") in TERMINAL or ui_id not in pending:
+                    held.pop(ui_id)  # answered, cancelled, or the job moved on
+                elif force or now >= deadline:
+                    held.pop(ui_id)
+                    if self.enabled:
+                        self.emit("run.needs_input", job, session, lane, summary, input_request=request)
 
     def finished(self, job, session, lane):
         self.runs.pop(job["id"], None)
@@ -124,6 +188,7 @@ class Notifications:
     def tick(self, jobs, sessions, lanes, busy):
         if not self.enabled:
             return
+        self.release_held(jobs)
         now = self.clock()
         settings = self.dispatcher.settings
         by_session = {lane["sessionId"]: lane for lane in lanes.values()}

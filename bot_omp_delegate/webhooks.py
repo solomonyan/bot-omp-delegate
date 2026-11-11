@@ -49,8 +49,45 @@ class ConfigError(ValueError):
     """Only static, non-secret diagnostics may be passed here."""
 
 
+# Tool-approval prompts in these roots are usually cleared by a scoped
+# approver within one poll (20 s), so run.needs_input is held for a grace
+# period and dropped if answered first. grace 0 restores immediate delivery.
+DEFAULT_NEEDS_INPUT_GRACE_SECONDS = 30
+DEFAULT_NEEDS_INPUT_GRACE_ROOTS = ("~/lanes/omp-runs/design/launch-2026-11-11/",)
+GRACE_SECONDS_ENV = "OMP_DELEGATE_NEEDS_INPUT_GRACE_SECONDS"
+GRACE_ROOTS_ENV = "OMP_DELEGATE_NEEDS_INPUT_GRACE_ROOTS"
+
+
 def _default():
     return {"version": 1, "stall_seconds": 1800, "idle_seconds": None, "subscribers": []}
+
+
+def _grace_seconds(value):
+    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 600
+
+
+def _grace_roots(value):
+    return isinstance(value, list) and all(isinstance(v, str) and v.strip() and not any(ord(c) < 32 for c in v) for v in value)
+
+
+def needs_input_grace(config, environ=None):
+    """Effective (seconds, roots). Env overrides config; invalid env is ignored."""
+    environ = os.environ if environ is None else environ
+    seconds = config.get("needs_input_grace_seconds", DEFAULT_NEEDS_INPUT_GRACE_SECONDS)
+    roots = config.get("needs_input_grace_roots", list(DEFAULT_NEEDS_INPUT_GRACE_ROOTS))
+    raw = environ.get(GRACE_SECONDS_ENV)
+    if raw is not None:
+        try:
+            value = float(raw)
+            if _grace_seconds(value):
+                seconds = value
+        except ValueError:
+            pass
+    raw = environ.get(GRACE_ROOTS_ENV)
+    if raw is not None:
+        roots = [r for r in raw.split(os.pathsep) if r.strip()]
+    resolved = tuple(os.path.realpath(os.path.expanduser(r)) for r in roots)
+    return seconds, resolved
 
 
 def _invalid():
@@ -116,10 +153,14 @@ def _subscriber(item):
 
 
 def _config(raw):
-    if not isinstance(raw, dict) or set(raw) - {"version", "stall_seconds", "idle_seconds", "subscribers"} or type(raw.get("version")) is not int or raw["version"] != 1:
+    if not isinstance(raw, dict) or set(raw) - {"version", "stall_seconds", "idle_seconds", "subscribers", "needs_input_grace_seconds", "needs_input_grace_roots"} or type(raw.get("version")) is not int or raw["version"] != 1:
         raise _invalid()
     result = {**_default(), **raw}
     if not _duration(result["stall_seconds"]) or not _duration(result["idle_seconds"], True) or not isinstance(result["subscribers"], list):
+        raise _invalid()
+    if "needs_input_grace_seconds" in raw and not _grace_seconds(raw["needs_input_grace_seconds"]):
+        raise _invalid()
+    if "needs_input_grace_roots" in raw and not _grace_roots(raw["needs_input_grace_roots"]):
         raise _invalid()
     result["subscribers"] = [_subscriber(s) for s in result["subscribers"]]
     if len({s["id"] for s in result["subscribers"]}) != len(result["subscribers"]):
@@ -335,7 +376,9 @@ class WebhookDispatcher:
     @property
     def settings(self):
         with self._lock:
-            return {"stall_seconds": self._config["stall_seconds"], "idle_seconds": self._config["idle_seconds"]}
+            seconds, roots = needs_input_grace(self._config)
+            return {"stall_seconds": self._config["stall_seconds"], "idle_seconds": self._config["idle_seconds"],
+                    "needs_input_grace_seconds": seconds, "needs_input_grace_roots": roots}
 
     def public_config(self):
         with self._lock:

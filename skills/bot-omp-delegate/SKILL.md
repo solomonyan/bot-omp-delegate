@@ -22,7 +22,7 @@ For conversational webhook delivery, set the coordinator subscriber to `mode: "c
   --detach --coordinator-subscriber-id COORDINATOR_ID --max-hours 6
 ```
 
-The recorded owner alone receives `run.done`, `run.error`, and `run.needs_input`; owner selection overrides event/lane filters. Ownerless jobs remain inspectable with `read`/`wait` and send no conversational webhook. The subscriber's monitor mode is not suitable for conversational delivery.
+The owner alone receives `run.done`, `run.error`, `run.needs_input` and `run.stalled`. The owner is the subscriber the job's `omp-caller:<name>` label maps to in `caller_routes`, else the recorded coordinator; owner selection overrides event/lane filters. Every other event stays in the daemon's local filtered-events log. Ownerless jobs remain inspectable with `read`/`wait` and send no webhook. The subscriber's monitor mode is not suitable for conversational delivery.
 
 Grok receives a question on `run.needs_input`, answers through the existing `answer` command, and receives the full final response on settlement. Continue follow-up work in the same lane/session. The `summary` field is only a bounded preview; use the full message/input fields. Receivers deduplicate by stable `event_id` before invoking Grok; `X-OMP-Delivery` is stable across HTTP retries but delivery is not exactly-once.
 

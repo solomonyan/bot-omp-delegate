@@ -4,7 +4,7 @@ Load this reference for webhook configuration/receivers, session retention/confi
 
 ## Questions and approvals
 
-Workers inherit OMP's configured approval policy unless an explicit `approval_mode` is supplied; existing explicit modes retain their behavior. A waiter or coordinator never grants permission on the owner's behalf. Inspect the full pending request and use its exact request ID and values/options:
+Every worker runs with `--approval-mode yolo`; the daemon stores any requested `approval_mode` as `yolo` and logs one stderr line for a non-yolo request. A waiter or coordinator never grants permission on the owner's behalf. Inspect the full pending request and use its exact request ID and values/options:
 
 ```sh
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","confirmed":false}'
@@ -55,9 +55,9 @@ Load this reference when configuring notifications, diagnosing delivery, or impl
 
 Set subscriber `mode` to `conversation` or `monitor`; omitted mode defaults to `monitor` for observer compatibility. Use `conversation` for the Grok coordinator receiver, so it is excluded from operational notifications.
 
-Pass `--coordinator-subscriber-id ID` with `lane run` or direct `turn`; HTTP dispatch uses `coordinator_subscriber_id`. The ID must exist in webhook configuration and is recorded on the job. Only this recorded owner receives `run.done`, `run.error`, and `run.needs_input`, with owner selection overriding its event/lane filters. A recorded owner may be either mode. Ownerless jobs have no conversational webhook and remain available through `read`/`wait`.
+Pass `--coordinator-subscriber-id ID` with `lane run` or direct `turn`; HTTP dispatch uses `coordinator_subscriber_id`. The ID must exist in webhook configuration and is recorded on the job. A `caller_routes` entry for the job's label (for example `"omp-caller:karen": "karen-omp-events"`) overrides it; an unmapped label, or one mapped to a subscriber that no longer exists, falls back to the recorded ID. That owner receives `run.done`, `run.error`, `run.needs_input` and `run.stalled`, with owner selection overriding its event/lane filters. A recorded owner may be either mode. Ownerless jobs have no webhook and remain available through `read`/`wait`.
 
-Operational events (`run.deadline`, `run.stalled`, `lane.idle`, `daemon.up`) use the configured event/lane filters and are delivered only to monitor subscribers. Notifications do not invoke Grok or change task/permission policy.
+Only `run.done`, `run.error`, `run.needs_input` and `run.stalled` are ever posted. Each goes to the subscriber that the job's label maps to in `caller_routes`, or, for an unmapped label, to the job's recorded `coordinator_subscriber_id`; owner selection overrides that subscriber's event/lane filters. `run.stalled` also reaches `monitor` subscribers whose filters match. Ownerless jobs remain available through `read`/`wait` and produce no webhook. Every other event (`run.deadline`, `lane.idle`, `daemon.up`) and every unrouted event is appended only to the private local log `<state-dir>/logs/events-filtered.jsonl` (redacted, `0600`, rotated to `.1` at 1 MiB). Notifications do not invoke a model.
 
 Grok submits once with the coordinator ID, handles `run.needs_input` through the existing `answer` path, receives the final full response, and continues in the same session. Use a detached job plus webhook as the conversational path; use `read`/`wait` for inspection and recovery rather than a second foreground wake path. Do not wake Grok for progress or operational events.
 
@@ -66,6 +66,8 @@ Version 1 notifications include `channel` (`conversation` or `monitor`), `sessio
 ### Private configuration
 
 Configuration lives at `<state-dir>/webhooks.json` (default state directory `~/.omp-delegate`, overridden by global `--state-dir`). An absent file uses version 1 defaults: `stall_seconds: 1800`, `idle_seconds: null`, and no subscribers. Timer values are configured in the private JSON file, not through subscriber commands. The file must be a regular, owner-owned `0600` file; symlinks and insecure permissions are rejected. Writes are atomic under the private state root.
+
+Optional `caller_routes` maps a job label to a subscriber ID (never a URL; endpoints and credentials stay in the subscriber entry). Older daemons reject this key, so add it to `webhooks.json` only after upgrading.
 
 The schema is:
 
@@ -123,7 +125,7 @@ Supported event names:
 | `run.deadline` | A CLI waiter reached its deadline; the underlying job may continue and is not cancelled by this event. |
 | `lane.idle` | Optional notification for an idle episode. |
 
-`run.done` and `run.error` also route only to the recorded coordinator owner. Ownerless jobs remain available through job read/wait APIs without conversational notifications. Operational events (`run.stalled`, `run.deadline`, `lane.idle`, `daemon.up`) use event/lane filters and only go to monitor subscribers. A stall is an inactivity signal, not proof of deadlock or task failure. A deadline is about the waiter, not task termination. Notifications have no automatic model calls or task-policy effects.
+Only `run.done`, `run.error`, `run.needs_input` and `run.stalled` are posted, to the routed owner (and `run.stalled` also to matching monitor subscribers). `run.deadline`, `lane.idle` and `daemon.up` are recorded in the local filtered-events log only; `webhook test` still posts directly to every subscriber. A stall is an inactivity signal, not proof of deadlock or task failure. A deadline is about the waiter, not task termination. Notifications have no automatic model calls or task-policy effects.
 
 Version 1 payloads include `channel`, `session_id`, `event_id`, `event`, `lane`, `lane_id`, `job_id`, `status`, `cwd`, `branch`, `last_commit_sha`, `summary`, and offset-aware ISO timestamp `ts`; `label` is optional. Terminal conversational events include full `message`; `run.needs_input` includes `input_id` and full input request. Summary is bounded to 300 characters and is only a diagnostic preview. Git metadata is resolved by delivery workers and may be empty when unavailable. Configured endpoint/auth/HMAC values are recursively redacted from user-visible string values, not structural keys or identifiers.
 
@@ -160,5 +162,5 @@ Response bodies, subscriber URLs, auth values, and signing secrets are excluded 
 
 ## Deadline and notification behavior
 
-`lane run` and direct `turn` accept `--label` as coordination metadata. A foreground waiter's `--max-hours` deadline triggers a best-effort `run.deadline` once per still-live job before any explicitly requested interruption; webhook failure does not alter the waiter's deadline exit status (3). Without `--interrupt-at-deadline`, the job remains running. A detached run has no foreground waiter/deadline. A label is optional, nonempty when supplied, at most 200 characters, and cannot contain control characters.
+`lane run` and direct `turn` accept `--label` as coordination metadata. A foreground waiter's `--max-hours` deadline records a `run.deadline` in the local filtered-events log once per still-live job before any explicitly requested interruption; webhook failure does not alter the waiter's deadline exit status (3). Without `--interrupt-at-deadline`, the job remains running. A detached run has no foreground waiter/deadline. A label is optional, nonempty when supplied, at most 200 characters, and cannot contain control characters.
 

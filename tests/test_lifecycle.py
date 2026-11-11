@@ -106,7 +106,7 @@ class LifecycleBehaviorTests(unittest.TestCase):
     def test_configure_merges_options_without_replacing_conversation(self):
         session = self.store.create({"name": "configured", "cwd": str(self.cwd), "options": {"model": "old"}})
         updated = self.store.session_action(session["id"], "configure", {"options": {"thinking": "high"}})
-        self.assertEqual(updated["options"], {"model": "old", "thinking": "high"})
+        self.assertEqual(updated["options"], {"model": "old", "thinking": "high", "approval_mode": "yolo"})
         self.assertEqual(updated["sessionDir"], session["sessionDir"])
 
 

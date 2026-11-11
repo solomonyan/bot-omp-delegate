@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Force every OMP worker to `--approval-mode yolo`. `approval_mode` on session create/configure and the CLI is accepted but stored as `yolo`, with one daemon stderr line for a non-yolo request and no webhook.
+- Post only `run.done`, `run.error`, `run.needs_input` and `run.stalled`. Everything else (`run.deadline`, `lane.idle`, `daemon.up`, unrouted events) goes to the private size-capped `<state-dir>/logs/events-filtered.jsonl`.
+- Route each event by its job label through the optional `caller_routes` label-to-subscriber map; unmapped labels keep the recorded coordinator subscriber.
 - Add a versioned `omp-dispatch` ticket wrapper that preserves session approval settings instead of reconfiguring permissions before every job. Keep machine-specific subscriber discovery and monitoring in private local adapters.
 - Route conversational notifications (`run.done`, `run.error`, `run.needs_input`) only to the recorded coordinator subscriber; add conversation/monitor modes, full response/input payloads, stable event identity, and event-based receiver deduplication guidance. Operational events remain monitor-only.
 - Grok's conversational workflow uses one detached job and its owner-routed webhook; questions use the existing answer path, and follow-up continues in the same session. OMP approval configuration is inherited unless an explicit mode is selected.

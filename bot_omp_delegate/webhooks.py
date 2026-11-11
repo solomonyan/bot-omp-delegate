@@ -53,22 +53,8 @@ class ConfigError(ValueError):
     """Only static, non-secret diagnostics may be passed here."""
 
 
-# Prompts are usually cleared by a scoped approver within one poll (20 s), so
-# run.needs_input is held for a grace period and dropped if answered first.
-# grace 0 restores immediate delivery.
-DEFAULT_NEEDS_INPUT_GRACE_SECONDS = 30
-GRACE_SECONDS_ENV = "OMP_DELEGATE_NEEDS_INPUT_GRACE_SECONDS"
-# KAREN's design sessions use the browser tool constantly; its prompt is
-# answered by the daemon instead of waking anyone.
-DEFAULT_TOOL_PREAPPROVALS = ({"cwd_root": "~/lanes/omp-runs/design/", "tools": ["browser"]},)
-
-
 def _default():
     return {"version": 1, "stall_seconds": 1800, "idle_seconds": None, "subscribers": []}
-
-
-def _grace_seconds(value):
-    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 600
 
 
 def _text(value):
@@ -77,35 +63,6 @@ def _text(value):
 
 def _caller_routes(value):
     return isinstance(value, dict) and all(_text(k) and len(k) <= 200 and isinstance(v, str) and _ID.fullmatch(v) for k, v in value.items())
-
-
-def _tool_preapprovals(value):
-    return isinstance(value, list) and all(
-        isinstance(rule, dict) and set(rule) == {"cwd_root", "tools"} and _text(rule["cwd_root"])
-        and os.path.isabs(os.path.expanduser(rule["cwd_root"]))
-        and isinstance(rule["tools"], list) and rule["tools"] and all(isinstance(t, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", t) for t in rule["tools"])
-        for rule in value)
-
-
-def needs_input_grace(config, environ=None):
-    """Effective grace seconds. Env overrides config; invalid env is ignored."""
-    environ = os.environ if environ is None else environ
-    seconds = config.get("needs_input_grace_seconds", DEFAULT_NEEDS_INPUT_GRACE_SECONDS)
-    raw = environ.get(GRACE_SECONDS_ENV)
-    if raw is not None:
-        try:
-            value = float(raw)
-            if _grace_seconds(value):
-                seconds = value
-        except ValueError:
-            pass
-    return seconds
-
-
-def tool_preapprovals(config):
-    """((resolved cwd root, frozenset of tool names), ...) the daemon answers itself."""
-    rules = config.get("tool_preapprovals", list(DEFAULT_TOOL_PREAPPROVALS))
-    return tuple((os.path.realpath(os.path.expanduser(r["cwd_root"])), frozenset(r["tools"])) for r in rules)
 
 
 def _invalid():
@@ -171,16 +128,12 @@ def _subscriber(item):
 
 
 def _config(raw):
-    if not isinstance(raw, dict) or set(raw) - {"version", "stall_seconds", "idle_seconds", "subscribers", "needs_input_grace_seconds", "caller_routes", "tool_preapprovals"} or type(raw.get("version")) is not int or raw["version"] != 1:
+    if not isinstance(raw, dict) or set(raw) - {"version", "stall_seconds", "idle_seconds", "subscribers", "caller_routes"} or type(raw.get("version")) is not int or raw["version"] != 1:
         raise _invalid()
     result = {**_default(), **raw}
     if not _duration(result["stall_seconds"]) or not _duration(result["idle_seconds"], True) or not isinstance(result["subscribers"], list):
         raise _invalid()
-    if "needs_input_grace_seconds" in raw and not _grace_seconds(raw["needs_input_grace_seconds"]):
-        raise _invalid()
     if "caller_routes" in raw and not _caller_routes(raw["caller_routes"]):
-        raise _invalid()
-    if "tool_preapprovals" in raw and not _tool_preapprovals(raw["tool_preapprovals"]):
         raise _invalid()
     result["subscribers"] = [_subscriber(s) for s in result["subscribers"]]
     if len({s["id"] for s in result["subscribers"]}) != len(result["subscribers"]):
@@ -396,9 +349,7 @@ class WebhookDispatcher:
     @property
     def settings(self):
         with self._lock:
-            return {"stall_seconds": self._config["stall_seconds"], "idle_seconds": self._config["idle_seconds"],
-                    "needs_input_grace_seconds": needs_input_grace(self._config),
-                    "tool_preapprovals": tool_preapprovals(self._config)}
+            return {"stall_seconds": self._config["stall_seconds"], "idle_seconds": self._config["idle_seconds"]}
 
     def public_config(self):
         with self._lock:

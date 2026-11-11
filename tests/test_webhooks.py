@@ -245,16 +245,13 @@ class WebhookTests(unittest.TestCase):
         self.assertIn("idle 99 ", current.read_text())
         self.assertEqual(Receiver.received, [])
 
-    def test_route_and_preapproval_config_is_validated(self):
+    def test_route_config_is_validated(self):
         add_subscriber(self.root, self.subscriber())
         for keys, ok in (({"caller_routes": {"omp-caller:karen": "karen-omp-events"}}, True),
                          ({"caller_routes": {"omp-caller:karen": "https://x.invalid/hook"}}, False),
                          ({"caller_routes": ["omp-caller:karen"]}, False),
-                         ({"tool_preapprovals": [{"cwd_root": "~/design/", "tools": ["browser"]}]}, True),
-                         ({"tool_preapprovals": []}, True),
-                         ({"tool_preapprovals": [{"cwd_root": "relative/", "tools": ["browser"]}]}, False),
-                         ({"tool_preapprovals": [{"cwd_root": "/x", "tools": []}]}, False),
-                         ({"tool_preapprovals": [{"cwd_root": "/x", "tools": ["*"]}]}, False)):
+                         ({"needs_input_grace_seconds": 30}, False),
+                         ({"tool_preapprovals": []}, False)):
             self.with_config(**keys)
             if ok:
                 load_config(self.root)
@@ -263,7 +260,8 @@ class WebhookTests(unittest.TestCase):
                     load_config(self.root)
             path = self.root / "webhooks.json"
             raw = json.loads(path.read_text())
-            raw.pop("caller_routes", None); raw.pop("tool_preapprovals", None)
+            for key in ("caller_routes", "needs_input_grace_seconds", "tool_preapprovals"):
+                raw.pop(key, None)
             path.write_text(json.dumps(raw)); os.chmod(path, 0o600)
 
     def test_redaction_precedes_summary_truncation_and_git_uses_event_worktree(self):

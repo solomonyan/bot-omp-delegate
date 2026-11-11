@@ -4,7 +4,7 @@ Load this reference for webhook configuration/receivers, session retention/confi
 
 ## Questions and approvals
 
-Workers inherit OMP's configured approval policy unless an explicit `approval_mode` is supplied; existing explicit modes retain their behavior. A waiter or coordinator never grants permission on the owner's behalf. Inspect the full pending request and use its exact request ID and values/options:
+Every worker runs with `--approval-mode yolo`; the daemon stores any requested `approval_mode` as `yolo` and logs one stderr line for a non-yolo request. A waiter or coordinator never grants permission on the owner's behalf. Inspect the full pending request and use its exact request ID and values/options:
 
 ```sh
 omp-delegate answer JOB_ID --json '{"id":"UI_ID","confirmed":false}'
@@ -57,7 +57,7 @@ Set subscriber `mode` to `conversation` or `monitor`; omitted mode defaults to `
 
 Pass `--coordinator-subscriber-id ID` with `lane run` or direct `turn`; HTTP dispatch uses `coordinator_subscriber_id`. The ID must exist in webhook configuration and is recorded on the job. A `caller_routes` entry for the job's label (for example `"omp-caller:karen": "karen-omp-events"`) overrides it; an unmapped label, or one mapped to a subscriber that no longer exists, falls back to the recorded ID. That owner receives `run.done`, `run.error`, `run.needs_input` and `run.stalled`, with owner selection overriding its event/lane filters. A recorded owner may be either mode. Ownerless jobs have no webhook and remain available through `read`/`wait`.
 
-Only `run.done`, `run.error`, `run.needs_input` and `run.stalled` are ever posted. Each goes to the subscriber that the job's label maps to in `caller_routes`, or, for an unmapped label, to the job's recorded `coordinator_subscriber_id`; owner selection overrides that subscriber's event/lane filters. `run.stalled` also reaches `monitor` subscribers whose filters match. Ownerless jobs remain available through `read`/`wait` and produce no webhook. Every other event (`run.deadline`, `lane.idle`, `daemon.up`), every unrouted event, every prompt answered within the needs-input grace and every pre-approved tool prompt is appended only to the private local log `<state-dir>/logs/events-filtered.jsonl` (redacted, `0600`, rotated to `.1` at 1 MiB). Notifications do not invoke a model.
+Only `run.done`, `run.error`, `run.needs_input` and `run.stalled` are ever posted. Each goes to the subscriber that the job's label maps to in `caller_routes`, or, for an unmapped label, to the job's recorded `coordinator_subscriber_id`; owner selection overrides that subscriber's event/lane filters. `run.stalled` also reaches `monitor` subscribers whose filters match. Ownerless jobs remain available through `read`/`wait` and produce no webhook. Every other event (`run.deadline`, `lane.idle`, `daemon.up`) and every unrouted event is appended only to the private local log `<state-dir>/logs/events-filtered.jsonl` (redacted, `0600`, rotated to `.1` at 1 MiB). Notifications do not invoke a model.
 
 Grok submits once with the coordinator ID, handles `run.needs_input` through the existing `answer` path, receives the final full response, and continues in the same session. Use a detached job plus webhook as the conversational path; use `read`/`wait` for inspection and recovery rather than a second foreground wake path. Do not wake Grok for progress or operational events.
 
@@ -67,9 +67,7 @@ Version 1 notifications include `channel` (`conversation` or `monitor`), `sessio
 
 Configuration lives at `<state-dir>/webhooks.json` (default state directory `~/.omp-delegate`, overridden by global `--state-dir`). An absent file uses version 1 defaults: `stall_seconds: 1800`, `idle_seconds: null`, and no subscribers. Timer values are configured in the private JSON file, not through subscriber commands. The file must be a regular, owner-owned `0600` file; symlinks and insecure permissions are rejected. Writes are atomic under the private state root.
 
-Optional `needs_input_grace_seconds` (0-600, default 30) delays every `run.needs_input`, so a scoped auto-approver can answer first. A prompt answered, cancelled or superseded by job completion within the grace is only logged locally; one still pending is sent once, unchanged. `OMP_DELEGATE_NEEDS_INPUT_GRACE_SECONDS` overrides the file; `0` is the kill switch.
-
-Optional `caller_routes` maps a job label to a subscriber ID (never a URL; endpoints and credentials stay in the subscriber entry). Optional `tool_preapprovals` is a list of `{"cwd_root": ABSOLUTE_PATH, "tools": [NAME, ...]}`; the default is `[{"cwd_root": "~/lanes/omp-runs/design/", "tools": ["browser"]}]` and `[]` disables it. The daemon answers a prompt titled exactly `Allow tool: NAME` with its one-time approve option (never a session or directory grant) when the session cwd is under a matching root; anything else stays pending for a person. Older daemons reject these keys, so add them to `webhooks.json` only after upgrading.
+Optional `caller_routes` maps a job label to a subscriber ID (never a URL; endpoints and credentials stay in the subscriber entry). Older daemons reject this key, so add it to `webhooks.json` only after upgrading.
 
 The schema is:
 

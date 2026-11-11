@@ -3,45 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import copy
-import os
 import time
-
-TERMINAL = frozenset({"completed", "error", "aborted", "interrupted"})
-
-
-def _option_labels(request):
-    return [o if isinstance(o, str) else (o.get("label") or o.get("value") or "") if isinstance(o, dict) else ""
-            for o in request.get("options") or []]
-
-
-def is_tool_approval(request):
-    """OMP's per-tool permission dialog: select titled "Allow tool: ..." with an approve option."""
-    if not isinstance(request, dict) or request.get("method") != "select":
-        return False
-    title = request.get("title")
-    if not isinstance(title, str) or not title.startswith("Allow tool:"):
-        return False
-    return any(isinstance(label, str) and label.lower().startswith(("approve", "allow")) for label in _option_labels(request))
-
-
-def one_time_approval(request):
-    """The approve option that grants this call only, never a session/directory-wide grant."""
-    return next((label for label in _option_labels(request) if isinstance(label, str)
-                 and label.lower().startswith(("approve", "allow"))
-                 and not any(word in label.lower() for word in ("session", "directory", "always"))), None)
-
-
-def under_roots(cwd, roots):
-    if not isinstance(cwd, str) or not cwd or not roots:
-        return False
-    path = os.path.realpath(os.path.expanduser(cwd))
-    for root in roots:
-        try:
-            if os.path.commonpath([path, root]) == root:
-                return True
-        except ValueError:
-            continue
-    return False
 
 
 class Notifications:
@@ -59,25 +21,6 @@ class Notifications:
     def emit(self, event, job=None, session=None, lane=None, summary=None, input_request=None):
         if not self.enabled:
             return
-        payload = self._payload(event, job, session, lane, summary, input_request)
-        try:
-            # Only bounded enqueue is allowed here: caller may hold Store.cv.
-            owner = (job or {}).get("coordinator_subscriber_id")
-            if owner is None:
-                self.dispatcher.emit(payload)
-            else:
-                self.dispatcher.emit(payload, coordinator_subscriber_id=owner)
-        except Exception:
-            # Notification failure must not change an agent's outcome. No exception
-            # text is logged because transports can embed secret endpoint values.
-            self.failures += 1
-
-    def _record(self, reason, job, session, lane, summary, request):
-        record = getattr(self.dispatcher, "record_filtered", None)
-        if record is not None:
-            record(self._payload("run.needs_input", job, session, lane, summary, request), reason)
-
-    def _payload(self, event, job, session, lane, summary, input_request):
         job, session, lane = job or {}, session or {}, lane or {}
         conversational = event in {"run.done", "run.error", "run.needs_input"}
         payload = {
@@ -101,24 +44,17 @@ class Notifications:
         payload["event_id"] = key if conversational else f"{key}:{payload['ts']}"
         if job.get("label"):
             payload["label"] = job["label"]
-        return payload
-
-    def preapproval(self, request, session):
-        """The option to answer with when policy pre-approves this tool prompt in this session, else None."""
         try:
-            if not is_tool_approval(request):
-                return None
-            tool = request["title"][len("Allow tool:"):].strip()
-            rules = (getattr(self.dispatcher, "settings", None) or {}).get("tool_preapprovals") or ()
-            if not any(tool in tools and under_roots((session or {}).get("cwd"), (root,)) for root, tools in rules):
-                return None
-            return one_time_approval(request)
+            # Only bounded enqueue is allowed here: caller may hold Store.cv.
+            owner = job.get("coordinator_subscriber_id")
+            if owner is None:
+                self.dispatcher.emit(payload)
+            else:
+                self.dispatcher.emit(payload, coordinator_subscriber_id=owner)
         except Exception:
-            return None  # any doubt leaves the prompt to a person
-
-    def preapproved(self, job, session, lane, request):
-        if self.enabled:
-            self._record("preapproved", job, session, lane, request.get("title"), request)
+            # Notification failure must not change an agent's outcome. No exception
+            # text is logged because transports can embed secret endpoint values.
+            self.failures += 1
 
     def started(self, job):
         if self.enabled:
@@ -127,8 +63,7 @@ class Notifications:
     def _run(self, job):
         state = self.runs.get(job["id"])
         if state is None:
-            # held: input id -> (deadline, request, session, lane) for grace-delayed approvals.
-            state = {"last_output": self.clock(), "stalled": False, "waiting": False, "input_ids": set(), "held": {}}
+            state = {"last_output": self.clock(), "stalled": False, "waiting": False, "input_ids": set()}
             self.runs[job["id"]] = state
         return state
 
@@ -175,48 +110,12 @@ class Notifications:
             questions = request.get("questions")
             first = questions[0] if isinstance(questions, list) and questions and isinstance(questions[0], dict) else {}
             summary = request.get("title") or first.get("question") or "Question or approval requires input"
-            grace = self._grace()
-            if grace:
-                state["held"][ui_id] = (self.clock() + grace, request, session, lane, summary)
-                continue
             self.emit("run.needs_input", job, session, lane, summary, input_request=request)
 
-    def _grace(self):
-        """Seconds to hold every prompt before forwarding it, or 0 (kill switch) to forward now."""
-        try:
-            seconds = (getattr(self.dispatcher, "settings", None) or {}).get("needs_input_grace_seconds") or 0
-            return max(0, seconds)
-        except Exception:
-            return 0  # any doubt forwards immediately, as before this feature
-
-    def release_held(self, jobs, force=False):
-        """Forward held prompts still pending at their deadline (or now, if force); drop resolved ones.
-
-        Bounded enqueue only; the caller may hold Store.cv.
-        """
-        now = self.clock()
-        for jid, state in list(self.runs.items()):
-            held = state.get("held")
-            if not held:
-                continue
-            job = jobs.get(jid)
-            pending = {p.get("id") for p in (job or {}).get("pendingInput") or []}
-            for ui_id, (deadline, request, session, lane, summary) in list(held.items()):
-                if job is None or job.get("status") in TERMINAL or ui_id not in pending:
-                    held.pop(ui_id)  # answered, cancelled, or the job moved on
-                    if self.enabled:
-                        self._record("resolved_within_grace", job, session, lane, summary, request)
-                elif force or now >= deadline:
-                    held.pop(ui_id)
-                    if self.enabled:
-                        self.emit("run.needs_input", job, session, lane, summary, input_request=request)
-
     def finished(self, job, session, lane):
-        state = self.runs.pop(job["id"], None)
+        self.runs.pop(job["id"], None)
         if not self.enabled:
             return
-        for deadline, request, held_session, held_lane, summary in (state or {}).get("held", {}).values():
-            self._record("resolved_within_grace", job, held_session, held_lane, summary, request)
         self.emit("run.done" if job["status"] == "completed" else "run.error", job, session, lane,
                   summary=job.get("error") if job["status"] != "completed" else None)
         if lane:
@@ -225,7 +124,6 @@ class Notifications:
     def tick(self, jobs, sessions, lanes, busy):
         if not self.enabled:
             return
-        self.release_held(jobs)
         now = self.clock()
         settings = self.dispatcher.settings
         by_session = {lane["sessionId"]: lane for lane in lanes.values()}

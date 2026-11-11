@@ -52,7 +52,7 @@ def load_jobs(jobs_dir, lanes_by_id, sim_done=()):
 
 
 # --- verifier model family (2026-11-11): the verifier must be a different model family from the author.
-KIMI, CLAUDE, CODEX = "kimi-code/k3.1-pro", "anthropic/claude-opus-4-6", "openai-codex/gpt-6.1-sol"
+KIMI, CODEX = "kimi-code/k3.1-pro", "openai-codex/gpt-6.1-sol"  # Claude is never a verifier (Solomon, 11 Nov 2026 16:26 HKT)
 FAMILY = {"openai-codex": "codex", "openai": "codex", "kimi-code": "kimi", "anthropic": "claude"}
 
 
@@ -60,9 +60,9 @@ def family(model):
     return FAMILY.get((model or "").split("/", 1)[0], "unknown")
 
 
-def verifier_for(author_model, kimi_ok=True):
-    """Pure. Codex/unknown author -> Kimi (Claude if Kimi is off); Kimi/Claude author -> Codex. Returns (model, family)."""
-    m = CODEX if family(author_model) in ("kimi", "claude") else KIMI if kimi_ok else CLAUDE
+def verifier_for(author_model):
+    """Pure. Kimi author -> Codex; every other author (Codex, Claude, Grok, unknown) -> Kimi. Never Claude. Returns (model, family)."""
+    m = CODEX if family(author_model) == "kimi" else KIMI
     return m, family(m)
 
 

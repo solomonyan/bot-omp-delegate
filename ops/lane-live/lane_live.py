@@ -9,7 +9,7 @@ branch AND active omp jobs are under the Mac cap (6; 4 at load1>=25; none at loa
 Dry run: LANE_LIVE_DRY_RUN=1 runs the verify decision against live state, prints events to stdout, writes and
 dispatches nothing (LANE_LIVE_SIM_DONE=<job-id prefixes> treats those jobs as finished).
 2026-11-11 verifier family: each verify session is pinned (session configure --model) to a different family from the
-author's session model: Codex author -> kimi-code/k3.1-pro (Claude if LIVE/verifier-kimi.off exists), Kimi/Claude -> Codex."""
+author's session model: Kimi author -> Codex; every other author -> kimi-code/k3.1-pro. Never Claude."""
 import json, os, re, subprocess, sys, datetime as dt, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import verify_gate
 DRY = os.environ.get("LANE_LIVE_DRY_RUN") == "1"
@@ -114,7 +114,7 @@ if DRY or os.path.exists(f"{LIVE}/verify.live"):
         if any(s["name"] == lane_name for s in ls["side_lanes"]) and num not in vh:
             vh[num] = sha; ev(f"VERIFY-SKIP #{num} {lane_name} already exists (seeded verified_heads)"); continue
         amodel = verify_gate.author_model(branch, lanes, f"{H}/.omp-delegate/sessions")
-        vmodel, vfam = verify_gate.verifier_for(amodel, kimi_ok=not os.path.exists(f"{LIVE}/verifier-kimi.off"))
+        vmodel, vfam = verify_gate.verifier_for(amodel)
         afam = verify_gate.family(amodel)
         if DRY: ev(f"VERIFY-DRYRUN author_model={amodel or '?'} ({afam}) verifier_model={vmodel} ({vfam})")
         if DRY: ev(f"VERIFY-DRYRUN would dispatch #{num} {branch}@{sha} verifier={vname} (nothing dispatched)"); break

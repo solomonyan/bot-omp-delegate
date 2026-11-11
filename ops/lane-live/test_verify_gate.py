@@ -53,13 +53,14 @@ def test_codex_author_gets_kimi():
     assert verifier_for("openai-codex/gpt-6-luna") == ("kimi-code/k3.1-pro", "kimi")
 
 
-def test_kimi_off_falls_back_to_claude():
-    assert verifier_for("openai-codex/gpt-6.1-sol", kimi_ok=False) == ("anthropic/claude-opus-4-6", "claude")
+def test_claude_is_never_a_verifier():
+    for a in ("openai-codex/gpt-6.1-sol", "anthropic/claude-opus-4-6", "xai/grok-4.7", "", "kimi-code/k3.1-pro"):
+        assert verifier_for(a)[1] != "claude"
 
 
-def test_kimi_or_claude_author_gets_codex():
+def test_kimi_author_gets_codex_claude_author_gets_kimi():
     assert verifier_for("kimi-code/k3.1-pro") == ("openai-codex/gpt-6.1-sol", "codex")
-    assert verifier_for("anthropic/claude-opus-4-6") == ("openai-codex/gpt-6.1-sol", "codex")
+    assert verifier_for("anthropic/claude-opus-4-6") == ("kimi-code/k3.1-pro", "kimi")
 
 
 def test_unknown_author_defaults_to_kimi():

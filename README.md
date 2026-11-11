@@ -187,6 +187,74 @@ The `.gitignore` excludes common local environment files, credential/key files, 
 Provider credentials stay with each operator's OMP or Codex installation. That is not a guarantee that runtime output is secret-free: prompts, tool output and extensions can expose sensitive data if permitted. Review any transcript or diagnostic attachment before sharing it.
 
 
+## Mac disk prevention
+
+`scripts/mac-disk/` contains local maintenance tools, independent of daemon
+deployment. Run `python3 scripts/mac-disk/install.py` for safe dry-run installation,
+or add `--live-reaper` only after Lead approves the report. This copies the scripts
+and an outbound-library snapshot to `~/lanes/omp-runs/live/bin/disk/` and installs:
+
+| Label | Schedule | Mode |
+| --- | --- | --- |
+| `com.solomon.mac-disk-reaper` | Hourly | **Installed `--dry-run` after verification findings**; live mode requires renewed approval |
+| `com.solomon.mac-disk-watch` | Every 10 minutes | Live alerts and daily size log |
+| `com.solomon.mac-disk-weekly` | Daily 03:15 retry | Cleanup at most once per seven days |
+
+The reaper's keep configuration is at the top of `mac_disk_reaper.py`.
+Unproven ownership, active/unknown job state, dirty/untracked files, unpushed
+commits or refs, any common-repository stash, missing upstreams, protected paths
+and `ANSWER*.md` prevent removal. Shared stashes and tags are inspected for
+linked worktrees too; tag/ref-only commits must be reachable from remote refs.
+Bare repositories are identified before the non-Git cleanup path and receive the
+same stash/tag/ref checks; missing worktree/upstream evidence retains them.
+Git worktrees use `git worktree remove` followed by prune, never forced removal.
+Changed orphans are retained, not silently discarded. Chrome processes without
+provable ended-run ownership are retained; no process-name kill is used.
+Snapshots are counted, never deleted. Only finished job `.jsonl.gz` logs older
+than 30 days are eligible; matching job state remains.
+Live deletion rechecks running jobs, session/add-dir paths and active lane cwds
+at the removal boundary. This is still observational: dispatch can start between
+the final query and `git worktree remove`/`rmtree`. There is no shared dispatch
+lock with the running daemon. **The installed reaper remains dry-run**; any future
+live cleanup needs renewed approval and coordinated dispatch quiescence.
+
+Runtime output is private under `~/lanes/omp-runs/disk-prevention/`:
+append-only `reaper.log`, daily `daily-sizes.log`, alert latches in
+`watch-state.json`, and cleanup completion in `weekly-state.json`.
+Partial `du` totals are retained and identified in `partial_folders`; only missing
+or invalid measurements become `null`. `mac_disk_ops.py daily --refresh` appends
+an explicitly requested fresh measurement without rewriting earlier log lines.
+Watch alerts latch independently below 50GB and 25GB, and re-arm only above
+60GB. The 25GB alert also displays “dispatch is now blocked” through macOS
+notifications. Failed webhook delivery retries on the next tick.
+`disk_emit.py` sends `disk.low` only to `jarvis-omp-events` through the delegate's
+own configured outbound transport, authentication, redaction and signing code;
+no secrets are printed or copied into scripts. This explicitly targeted local
+operator alert does not change subscriber configuration or restart the daemon.
+`mac_disk_ops.py notification-test` posts one clearly labeled test notification
+using the normal notification path. `disk_emit.py --test --threshold-gb 25
+--free-gb CURRENT` sends one test-marked `disk.low` HTTP attempt, even above the
+threshold, and returns its status and `request_id` (`X-OMP-Delivery`). Neither
+test command changes `watch-state.json`.
+
+Weekly cleanup runs `brew cleanup -s` then `pnpm store prune`, checking for active
+or unknown job state before each command. An active job skips cleanup until the
+next day's attempt. This is an observation gate, not an atomic daemon dispatch
+lock: a job can start after the check.
+
+The event-writer code in this PR requires Solomon's authorized daemon restart
+after deployment; installing these tools does not activate it. Keep the current
+lane dispatch floor, log-size warning, 15GB interrupt and idle gzip until then.
+The local `disk-prevention/lane_live-after-patch.diff` is an unapplied follow-up,
+changing interruption to the free-space floor only after writer deployment.
+
+The shipped `scripts/mac-disk/lane_live-gzip-terminal.diff` is installed locally,
+with backup `lane_live.py.bak-gzfix-1110`. Compression is restricted to known
+terminal jobs, never `waiting_input` or unknown states, and never overwrites an
+existing archive. Event reads merge existing archive prefixes and resumed plain
+tails by sequence, deduplicate cutover copies, and fall back across incomplete
+gzip/source disappearance. Session purge includes compressed job logs.
+
 ## Development
 
 ```sh

@@ -1,3 +1,5 @@
+import gzip
+import json
 from datetime import datetime
 from pathlib import Path
 import tempfile
@@ -136,6 +138,211 @@ class EventTests(unittest.TestCase):
         self.now += 1700
         self.store.monitor_tick()
         self.assertEqual(self.names(), ["run.stalled"])
+    def test_stream_and_progress_are_dropped_while_final_results_and_questions_survive(self):
+        job = self.run_job()
+        started = {"type": "subagent_lifecycle", "payload": {"id": "child", "status": "started"}}
+        self.event(started)
+        for kind in ("tool_stream_update", "subagent_progress"):
+            frame = {"type": kind, "text": "streaming progress"}
+            self.event(frame)
+            self.event({"type": "subagent_event", "payload": {"id": "child", "event": frame}})
+            self.event({"type": "subagent_event", "payload": {"id": "child", "event": {
+                "type": "subagent_event", "payload": {"id": "grandchild", "event": frame},
+            }}})
+        finals = [
+            {"type": "tool_execution_end", "result": {"content": [{"type": "text", "text": "tool result"}]}},
+            {"type": "subagent_event", "payload": {"id": "child", "event": {
+                "type": "tool_execution_end", "result": {"content": [{"type": "text", "text": "child tool result"}]},
+            }}},
+            {"type": "subagent_event", "payload": {"id": "child", "event": {
+                "type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "child final"}]},
+            }}},
+            {"type": "subagent_lifecycle", "payload": {"id": "child", "status": "completed"}},
+            {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "parent final"}]}},
+        ]
+        for frame in finals:
+            self.event(frame)
+        question = {"type": "extension_ui_request", "id": "approval", "method": "confirm", "title": "Continue?"}
+        self.event(question)
+        self.assertEqual(self.store.job(job["id"])["pendingInput"], [question])
+        self.assertEqual(self.sink.events[-1]["input"], question)
+        cancel = {"type": "extension_ui_request", "method": "cancel", "targetId": "approval"}
+        completed = {"type": "prompt_result", "id": job["id"], "status": "completed", "sessionSettled": True}
+        self.event(cancel)
+        self.event(completed)
+        expected = [dict(frame, seq=seq) for seq, frame in enumerate([started, *finals, question, cancel, completed])]
+        path = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], expected)
+        self.assertEqual(self.store.events(job["id"], 0)["events"], expected)
+        self.assertEqual(self.store.job(job["id"])["finalMessage"], "parent final")
+        self.assertEqual(self.store.job(job["id"])["pendingInput"], [])
+        self.assertEqual(self.store.job(job["id"])["status"], "completed")
+        self.assertEqual(self.names(), ["run.needs_input", "run.done"])
+        self.assertEqual(self.sink.events[-1]["message"], "parent final")
+
+    def test_dropped_tool_streams_update_in_memory_stalls_but_progress_does_not_mask_silence(self):
+        job = self.run_job()
+        self.now = 1700
+        self.event({"type": "tool_stream_update", "text": "tool output"})
+        self.now = 3499
+        progress = {"type": "subagent_progress", "text": "status only"}
+        self.event(progress)
+        self.event({"type": "subagent_event", "payload": {"id": "child", "event": progress}})
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), [])
+        self.now = 3500
+        self.store.monitor_tick()
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), ["run.stalled"])
+        self.now = 3600
+        self.event({"type": "subagent_event", "payload": {"id": "child", "event": {
+            "type": "tool_stream_update", "delta": "child tool output",
+        }}})
+        self.now = 5399
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), ["run.stalled"])
+        self.now = 5400
+        self.store.monitor_tick()
+        self.assertEqual(self.names(), ["run.stalled", "run.stalled"])
+        self.assertEqual(self.store.events(job["id"], 0), {"events": [], "next": 0})
+        self.assertEqual(self.store.job(job["id"])["nextSeq"], 0)
+        self.assertFalse((self.store.root / "jobs" / f"{job['id']}.jsonl").exists())
+
+    def test_transient_delta_persistence_is_bounded_and_final_events_keep_sequences(self):
+        import gzip
+        import json
+
+        job = self.run_job()
+        self.now = 123
+        delta = "x" * 256
+        children = ("child-a", "child-b", "child-c")
+        for index in range(200):
+            content = [{"type": "text", "text": delta * (index + 1)}]
+            message = {"role": "assistant", "content": content}
+            update = {"type": "message_update", "message": message,
+                      "assistantMessageEvent": {"type": "text_delta", "delta": delta,
+                                                "partial": message}}
+            self.event(update)
+            self.event({"type": "tool_execution_update", "partialResult": {"content": content}})
+            for child in children:
+                self.event({"type": "subagent_event", "payload": {"id": child, "event": update}})
+                self.event({"type": "subagent_event", "payload": {"id": child, "event": {
+                    "type": "tool_execution_update", "partialResult": {"content": content},
+                }}})
+        final_text = delta * 200
+        self.assertEqual(self.store.notifications.runs[job["id"]]["last_output"], 123)
+        for child in children:
+            self.event({"type": "subagent_event", "payload": {"id": child, "event": {
+                "type": "message_end", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": final_text},
+                ]},
+            }}})
+        self.event({"type": "tool_execution_end", "result": {"content": [{"type": "text", "text": final_text}]}})
+        self.event({"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": final_text},
+        ]}})
+        self.event({"type": "extension_ui_request", "id": "input-1", "method": "confirm", "title": "Continue?"})
+
+        path = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        persisted_bytes = path.stat().st_size
+        self.assertLess(persisted_bytes, len(final_text.encode("utf-8")) * 5 * 1.1)
+        stored = self.store.events(job["id"], 0)
+        self.assertEqual([event["seq"] for event in stored["events"]], list(range(len(stored["events"]))))
+        self.assertEqual([event["type"] for event in stored["events"]], [
+            "subagent_event", "subagent_event", "subagent_event", "tool_execution_end", "message_end", "extension_ui_request",
+        ])
+        for event in stored["events"][:3]:
+            self.assertEqual(event["payload"]["event"]["message"]["content"][0]["text"], final_text)
+        self.assertEqual(stored["events"][3]["result"]["content"][0]["text"], final_text)
+        self.assertEqual(self.store.job(job["id"])["finalMessage"], final_text)
+        self.assertEqual(self.store.job(job["id"])["pendingInput"][0]["id"], "input-1")
+        self.assertEqual(self.store.notifications.runs[job["id"]]["last_output"], 123)
+
+        compressed = path.with_suffix(".jsonl.gz")
+        compressed.write_bytes(b"\x1f\x8b")
+        self.assertEqual(self.store.events(job["id"], 0), stored)
+        with path.open("rb") as source, gzip.open(compressed, "wb") as target:
+            target.write(source.read())
+        path.unlink()
+        self.assertEqual(self.store.events(job["id"], 1)["events"], stored["events"][1:])
+
+    def test_archive_and_resumed_plain_are_merged_deduplicated_and_paginated(self):
+        job = self.run_job()
+        directory = self.store.root / "jobs"
+        plain = directory / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        archived = [{"seq": seq, "type": "archived", "value": seq} for seq in range(120)]
+        with gzip.open(archive, "wt", encoding="utf-8") as stream:
+            for event in archived:
+                stream.write(json.dumps(event) + "\n")
+        resumed = [{"seq": seq, "type": "resumed", "value": seq} for seq in range(119, 140)]
+        plain.write_text("".join(json.dumps(event) + "\n" for event in resumed))
+
+        first = self.store.events(job["id"], 0)
+        self.assertEqual([event["seq"] for event in first["events"]], list(range(100)))
+        self.assertEqual(first["next"], 100)
+        second = self.store.events(job["id"], first["next"])
+        self.assertEqual([event["seq"] for event in second["events"]], list(range(100, 140)))
+        self.assertEqual(second["events"][19]["type"], "resumed")
+
+    def test_plain_log_survives_truncated_archive(self):
+        job = self.run_job()
+        plain = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        plain.write_text(json.dumps({"seq": 0, "type": "committed"}) + "\n")
+        archive.write_bytes(b"\x1f\x8btruncated")
+        self.assertEqual(self.store.events(job["id"], 0)["events"], [{"seq": 0, "type": "committed"}])
+
+    def test_archive_fallback_when_plain_disappears_during_open(self):
+        job = self.run_job()
+        directory = self.store.root / "jobs"
+        plain = directory / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        event = {"seq": 0, "type": "archived"}
+        with gzip.open(archive, "wt", encoding="utf-8") as stream:
+            stream.write(json.dumps(event) + "\n")
+        plain.write_text(json.dumps({"seq": 0, "type": "plain"}) + "\n")
+        path_open = Path.open
+        def unlink_during_plain_open(path, *args, **kwargs):
+            if path == plain:
+                plain.unlink()
+            return path_open(path, *args, **kwargs)
+        with patch.object(Path, "open", unlink_during_plain_open):
+            self.assertEqual(self.store.events(job["id"], 0)["events"], [event])
+
+    def test_plain_unlink_after_open_preserves_committed_events(self):
+        job = self.run_job()
+        plain = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        event = {"seq": 0, "type": "committed"}
+        archive.write_bytes(b"\x1f\x8b")
+        plain.write_text(json.dumps(event) + "\n")
+        path_open = Path.open
+        def unlink_after_open(path, *args, **kwargs):
+            stream = path_open(path, *args, **kwargs)
+            if path == plain:
+                plain.unlink()
+            return stream
+        with patch.object(Path, "open", unlink_after_open):
+            self.assertEqual(self.store.events(job["id"], 0)["events"], [event])
+
+    def test_partial_archive_finishes_when_plain_open_loses_cutover_race(self):
+        job = self.run_job()
+        plain = self.store.root / "jobs" / f"{job['id']}.jsonl"
+        archive = plain.with_suffix(".jsonl.gz")
+        event = {"seq": 0, "type": "committed"}
+        archive.write_bytes(b"\x1f\x8b")
+        plain.write_text(json.dumps(event) + "\n")
+        path_open = Path.open
+        def complete_cutover(path, *args, **kwargs):
+            if path == plain and plain.exists():
+                with gzip.open(archive, "wt", encoding="utf-8") as stream:
+                    stream.write(json.dumps(event) + "\n")
+                plain.unlink()
+            return path_open(path, *args, **kwargs)
+        with patch.object(Path, "open", complete_cutover):
+            self.assertEqual(self.store.events(job["id"], 0)["events"], [event])
+
 
     def test_deadline_is_once_per_live_job_and_never_cancels(self):
         job = self.run_job("OPS-9")

@@ -1,0 +1,20 @@
+--- a/lane_live.py
++++ b/lane_live.py
+@@ -23,7 +23,7 @@
+     ev("HOLD DRAIN-HOLD present; no dispatch"); sys.exit(0)
+ # LOG-CAP (FRIDAY 2026-11-10): omp-delegate logs every subagent streaming delta with the full cumulative
+ # message (twice), so long jobs grow quadratically (fc88dc33 hit 48GB). Runs before DISK-LOW so it works when disk is low.
+-# Warn once >JOB_LOG_WARN_GB, interrupt a running job >JOB_LOG_CAP_GB, gzip one finished log idle >2h per tick.
++# Warn once >JOB_LOG_WARN_GB, interrupt a running job >JOB_LOG_CAP_GB, gzip one terminal log idle >2h per tick.
+ _J = f"{H}/.omp-delegate/jobs"; _WARN = float(os.environ.get("JOB_LOG_WARN_GB", "5")); _CAP = float(os.environ.get("JOB_LOG_CAP_GB", "15"))
+ os.makedirs(f"{LIVE}/logcap", exist_ok=True)
+ _gz_busy = subprocess.run(["pgrep", "-x", "gzip"], capture_output=True).returncode == 0
+@@ -37,7 +37,7 @@
+             ev(f"LOG-CAP job {_id[:8]} log {_s:.1f}GB > {_CAP:g}GB: interrupted (resume in same session)")
+         elif _s > _WARN and not os.path.exists(f"{LIVE}/logcap/{_id}.warn"):
+             open(f"{LIVE}/logcap/{_id}.warn", "w").write(NOW + "\n"); ev(f"LOG-WARN job {_id[:8]} log {_s:.1f}GB > {_WARN:g}GB")
+-    elif _age > 7200 and not _gz_busy and not os.path.exists(_p + ".gz"):
++    elif _stt in ("completed", "error", "aborted", "interrupted") and _age > 7200 and not _gz_busy and not os.path.exists(_p + ".gz"):
+         subprocess.Popen(["gzip", "-6", _p], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+         _gz_busy = True; ev(f"LOG-GZ job {_id[:8]} {_s:.2f}GB idle {_age/3600:.1f}h: gzip started")
+ import shutil as _sh

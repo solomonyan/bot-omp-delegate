@@ -4,6 +4,7 @@ import http.server
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -104,6 +105,68 @@ class WebhookTests(unittest.TestCase):
         self.assertEqual(headers["X-OMP-Signature"], "sha256=" + hmac.new(b"synthetic-key", body, hashlib.sha256).hexdigest())
         self.assertEqual(headers["X-OMP-Event"], "daemon.up")
         dispatcher.close()
+
+    def test_disk_low_targets_configured_conversation_subscriber_with_signature(self):
+        add_subscriber(self.root, {
+            "id": "jarvis-omp-events", "url": self.url, "mode": "conversation",
+            "events": ["run.done"], "hmac_secret": "synthetic-disk-key",
+        })
+        add_subscriber(self.root, self.subscriber(id="unrelated", events=["disk.low"]))
+        dispatcher = WebhookDispatcher(self.root, retry_delays=(), request_timeout=1)
+        try:
+            result = dispatcher.emit_disk_low(free_gb=12.5, threshold_gb=20)
+            self.assertEqual(result["configured"], 1)
+            self.assertEqual(result["delivered"], 1)
+            self.assertEqual(result["results"][0]["subscriber_id"], "jarvis-omp-events")
+            self.assertEqual(len(Receiver.received), 1)
+            body, headers = Receiver.received[0]
+            payload = json.loads(body)
+            self.assertEqual(payload["event"], "disk.low")
+            self.assertEqual(payload["channel"], "monitor")
+            self.assertEqual(payload["free_gb"], 12.5)
+            self.assertEqual(headers["X-OMP-Event"], "disk.low")
+            self.assertEqual(headers["X-OMP-Signature"], "sha256=" + hmac.new(b"synthetic-disk-key", body, hashlib.sha256).hexdigest())
+        finally:
+            dispatcher.close()
+
+    def test_disk_emit_test_marks_current_space_and_sends_only_one_http_attempt(self):
+        add_subscriber(self.root, {
+            "id": "jarvis-omp-events", "url": self.url, "mode": "conversation",
+            "events": ["run.done"], "hmac_secret": "synthetic-disk-key",
+        })
+        script = Path(__file__).resolve().parents[1] / "scripts/mac-disk/disk_emit.py"
+        for status in (204, 503):
+            with self.subTest(status=status):
+                Receiver.received = []
+                Receiver.response_status = status
+                result = subprocess.run(
+                    [sys.executable, "-B", str(script), "--test", "--threshold-gb", "25", "--free-gb", "123.4"],
+                    env={**os.environ, "OMP_DELEGATE_STATE": str(self.root)},
+                    capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0 if status == 204 else 1)
+                receipt = json.loads(result.stdout)["results"][0]
+                self.assertEqual(receipt["status_code"], status)
+                self.assertEqual(receipt["attempts"], 1)
+                self.assertEqual(len(Receiver.received), 1)
+                body, headers = Receiver.received[0]
+                payload = json.loads(body)
+                self.assertIs(payload["test"], True)
+                self.assertEqual(payload["status"], "test")
+                self.assertEqual(payload["free_gb"], 123.4)
+                self.assertEqual(receipt["request_id"], headers["X-OMP-Delivery"])
+                self.assertEqual(headers["X-OMP-Signature"], "sha256=" + hmac.new(
+                    b"synthetic-disk-key", body, hashlib.sha256).hexdigest())
+
+    def test_disk_low_requires_low_space_and_target_configuration(self):
+        dispatcher = WebhookDispatcher(self.root, retry_delays=(), request_timeout=1)
+        try:
+            with self.assertRaises(ConfigError):
+                dispatcher.emit_disk_low(free_gb=20, threshold_gb=20)
+            with self.assertRaises(ConfigError):
+                dispatcher.emit_disk_low(free_gb=1, threshold_gb=20)
+        finally:
+            dispatcher.close()
 
     def test_retries_non_2xx_and_success(self):
         add_subscriber(self.root, self.subscriber())

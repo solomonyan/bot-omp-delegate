@@ -94,6 +94,14 @@ class LifecycleBehaviorTests(unittest.TestCase):
         self.assertNotIn(sid, restarted.sessions)
         self.assertFalse((self.root / "purge.json").exists())
 
+    def test_purge_removes_compressed_job_events(self):
+        session = self.store.create({"name": "purge", "cwd": str(self.cwd)})
+        job_id = "c" * 32
+        archive = self.root / "jobs" / f"{job_id}.jsonl.gz"
+        archive.write_bytes(b"compressed event archive")
+        self.store._apply_purge(session["id"], {job_id})
+        self.assertFalse(archive.exists())
+
     def test_old_job_controls_rejected_after_worker_generation_changes(self):
         lane = self.store.create_lane({"name": "lane", "cwd": str(self.cwd)})
         sid = lane["sessionId"]

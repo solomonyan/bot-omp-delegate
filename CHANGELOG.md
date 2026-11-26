@@ -20,6 +20,8 @@
 - Versioned legacy-state migration and recoverable scoped purge. Serialize lifecycle transitions, quarantine failed cleanup, and reject stale controls and cross-task child transcript access.
 - Bounded OMP worker/process-group shutdown, including interrupt-close during startup, prewarming, pending questions and active work. Detached/external processes remain outside the guarantee.
 - Concise routine Grok skill with advanced instructions loaded on demand; no frontend, new dependencies, automatic idle timeout or Grok-native telemetry integration.
+- Bound persisted job event logs by dropping cumulative streaming and progress frames while retaining results, questions and lifecycle events. Merge plain and gzip event logs by sequence and purge both formats.
+- Add macOS disk maintenance with latched alerts, daily size reports and an idle-only weekly cleanup. The hourly reaper defaults to dry-run and needs local protected prefixes for live deletion. Retain active paths, unpublished Git refs and stashes, and keep installation independent of daemon restart.
 
 
 Continuation/wake verification: `python3 -B -m unittest discover -s tests -v` passed all 83 tests. Separate CLI/HTTP/Worker smoke with an offline RPC peer retained the same parent session and worker process, sent one prompt, captured the resumed result and delivered one completion webhook. A loopback retry smoke against the existing receiver code with temporary state produced two HTTP attempts sharing one delivery UUID and one coordinator forward attempt. No paid model-backed engine run or live Grok endpoint was exercised; the production daemon/config/receiver/ledger were left untouched. Source activation requires a later authorized daemon restart.

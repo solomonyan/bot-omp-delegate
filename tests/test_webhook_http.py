@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -57,6 +58,16 @@ class WebhookHttpTests(unittest.TestCase):
         except RuntimeError:
             pass
 
+    def filtered(self, state, timeout=3):
+        path = state / "logs" / "events-filtered.jsonl"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists() and path.read_text().strip():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                return json.loads(path.read_text().splitlines()[0])
+            time.sleep(0.05)
+        self.fail("no filtered event was recorded")
+
     def test_real_daemon_startup_and_stdin_provisioning_test_remove(self):
         state = self.root / "daemon-state"
         with socket.socket() as reservation:
@@ -68,10 +79,10 @@ class WebhookHttpTests(unittest.TestCase):
         self.assertEqual((state / "webhooks.json").stat().st_mode & 0o777, 0o600)
         self.addCleanup(self.stop_daemon, state, port)
         self.cli(state, port, "daemon", "start")
-        startup = self.received.get(timeout=3)
-        self.assertEqual((startup["event"], startup["version"], startup["status"]), ("daemon.up", 1, "up"))
+        startup = self.filtered(state)
+        self.assertEqual((startup["event"], startup["status"], startup["reason"]), ("daemon.up", "up", "not_allowlisted"))
         self.assertIsNotNone(datetime.fromisoformat(startup["ts"]).utcoffset())
-        self.assertTrue(all(startup[key] == "" for key in ("lane", "lane_id", "job_id", "cwd", "branch", "last_commit_sha")))
+        self.assertTrue(self.received.empty(), "daemon.up is recorded locally, never posted")
         receipt = self.cli(state, port, "webhook", "test", "--event", "run.done")
         self.assertEqual((receipt["configured"], receipt["delivered"], receipt["results"][0]["status_code"]), (1, 1, 204))
         self.assertEqual(self.received.get(timeout=3)["event"], "run.done", "Explicit connectivity tests bypass subscriber filters")
@@ -81,7 +92,7 @@ class WebhookHttpTests(unittest.TestCase):
         self.cli(state, port, "daemon", "restart", "--idle-only")
         self.cli(state, port, "daemon", "stop", "--idle-only")
 
-    def test_foreground_deadline_and_labeled_completion_reach_receiver(self):
+    def test_foreground_deadline_stays_local_and_labeled_completion_reaches_receiver(self):
         state = self.root / "http-state"
         hub = WebhookDispatcher(state, retry_delays=())
         store = Store(state, hub)
@@ -104,12 +115,13 @@ class WebhookHttpTests(unittest.TestCase):
             job = self.cli(state, port, "lane", "run", lane["id"], "work", "--label", "OPS-42",
                            "--coordinator-subscriber-id", "coordinator", "--detach")
         self.cli(state, port, "wait", job["id"], "--max-hours", "0.000001", expected=3)
-        deadline = self.received.get(timeout=3)
+        deadline = self.filtered(state)
         self.assertEqual((deadline["event"], deadline["job_id"], deadline["label"]), ("run.deadline", job["id"], "OPS-42"))
         self.assertEqual(store.job(job["id"])["status"], "running")
         store.event(lane["sessionId"], {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "Change complete"}]}})
         store.event(lane["sessionId"], {"type": "prompt_result", "id": job["id"], "status": "completed", "sessionSettled": True})
         done = self.received.get(timeout=3)
+        self.assertTrue(self.received.empty(), "only run.done reached the receiver")
         self.assertEqual((done["event"], done["summary"], done["label"], done["lane_id"]), ("run.done", "Change complete", "OPS-42", lane["id"]))
         self.assertEqual(done["cwd"], str(self.project.resolve()))
         self.assertEqual((done["channel"], done["message"], done["session_id"]),

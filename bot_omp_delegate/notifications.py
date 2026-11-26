@@ -46,7 +46,7 @@ class Notifications:
             payload["label"] = job["label"]
         try:
             # Only bounded enqueue is allowed here: caller may hold Store.cv.
-            owner = job.get("coordinator_subscriber_id") if conversational else None
+            owner = job.get("coordinator_subscriber_id")
             if owner is None:
                 self.dispatcher.emit(payload)
             else:

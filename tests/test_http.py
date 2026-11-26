@@ -120,7 +120,7 @@ class HttpLifecycleTests(unittest.TestCase):
                 job = self.client.request("GET", f'/jobs/{json.loads(result.stdout)["id"]}')
                 self.assertEqual(job["sessionId"], lane["sessionId"])
                 session = self.client.request("GET", f'/sessions/{lane["sessionId"]}')
-                self.assertEqual(session["options"], options)
+                self.assertEqual(session["options"], {"approval_mode": "yolo"})
 
     def test_wait_preserves_terminal_provider_error_over_http(self):
         from unittest.mock import patch

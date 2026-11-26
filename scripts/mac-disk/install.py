@@ -7,11 +7,17 @@ import plistlib
 import shutil
 import subprocess
 
+from mac_disk_reaper import SafetyError, protected_prefixes
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live-reaper", action="store_true", help="enable reviewed live deletion instead of dry-run")
     args = parser.parse_args()
+    try:
+        protected_prefixes(required=args.live_reaper)
+    except SafetyError as exc:
+        parser.error(str(exc))
     source = Path(__file__).resolve().parent
     home = Path.home()
     target = home / "lanes/omp-runs/live/bin/disk"

@@ -20,11 +20,18 @@ class MacDiskReaperSafetyTests(unittest.TestCase):
         self.assertTrue(reaper._overlaps(root / "child", root))
         self.assertFalse(reaper._overlaps(root, Path("/tmp/elsewhere")))
 
-    def test_protected_wellness_name_is_screened_without_git_inspection(self):
-        with tempfile.TemporaryDirectory() as directory:
-            candidate = Path(directory) / "wellness-ops-private"
-            candidate.mkdir()
-            self.assertTrue(reaper._protected_path(candidate))
+    def test_private_prefix_config_protects_matching_path_components(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(reaper, "STATE_DIR", Path(directory)):
+            (Path(directory) / "protected-prefixes.json").write_text('["verify-keep-"]')
+            prefixes = reaper.protected_prefixes(required=True)
+            self.assertTrue(reaper._protected_path(Path(directory) / "verify-keep-abc" / "child", prefixes))
+            self.assertFalse(reaper._protected_path(Path(directory) / "verify-other", prefixes))
+
+    def test_live_reaper_rejects_missing_or_empty_protection_config(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(reaper, "STATE_DIR", Path(directory)):
+            self.assertEqual(reaper.main([]), 1)
+            (Path(directory) / "protected-prefixes.json").write_text("[]")
+            self.assertEqual(reaper.main([]), 1)
 
     def test_answer_markdown_keeps_candidate(self):
         with tempfile.TemporaryDirectory() as directory:

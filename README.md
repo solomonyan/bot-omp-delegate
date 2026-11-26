@@ -178,7 +178,10 @@ and an outbound-library snapshot to `~/lanes/omp-runs/live/bin/disk/` and instal
 | `com.solomon.mac-disk-watch` | Every 10 minutes | Live alerts and daily size log |
 | `com.solomon.mac-disk-weekly` | Daily 03:15 retry | Cleanup at most once per seven days |
 
-The reaper's keep configuration is at the top of `mac_disk_reaper.py`.
+Put deployment-specific keep prefixes in the local
+`~/lanes/omp-runs/disk-prevention/protected-prefixes.json` as a JSON array of
+path-component prefixes (for example `["verify-keep-"]`). Live cleanup refuses
+to start without a nonempty list. Supply the same file when reviewing a dry run.
 Unproven ownership, active/unknown job state, dirty/untracked files, unpushed
 commits or refs, any common-repository stash, missing upstreams, protected paths
 and `ANSWER*.md` prevent removal. Shared stashes and tags are inspected for
@@ -220,14 +223,10 @@ or unknown job state before each command. An active job skips cleanup until the
 next day's attempt. This is an observation gate, not an atomic daemon dispatch
 lock: a job can start after the check.
 
-The event-writer code in this PR requires Solomon's authorized daemon restart
-after deployment; installing these tools does not activate it. Keep the current
-lane dispatch floor, log-size warning, 15GB interrupt and idle gzip until then.
-The local `disk-prevention/lane_live-after-patch.diff` is an unapplied follow-up,
-changing interruption to the free-space floor only after writer deployment.
+The event writer takes effect only after an operator-approved daemon restart.
+Installing the disk tools does not activate it.
 
-The shipped `scripts/mac-disk/lane_live-gzip-terminal.diff` is installed locally,
-with backup `lane_live.py.bak-gzfix-1110`. Compression is restricted to known
+`scripts/mac-disk/lane_live-gzip-terminal.diff` limits compression to known
 terminal jobs, never `waiting_input` or unknown states, and never overwrites an
 existing archive. Event reads merge existing archive prefixes and resumed plain
 tails by sequence, deduplicate cutover copies, and fall back across incomplete

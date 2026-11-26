@@ -21,13 +21,7 @@ LOG_PATH = STATE_DIR / "reaper.log"
 LOCK_PATH = STATE_DIR / "reaper.lock"
 JOBS_DIR = HOME / ".omp-delegate" / "jobs"
 LANE_CLI = HOME / "Workspace" / "bot-omp-delegate" / "scripts" / "omp-delegate"
-PROTECTED_NAMES = {
-    "wellness-ops-hk-payments", "wellness-ops-settings-ux",
-    "wellness-ops-main-baseline", "wellness-ops-pglite-tests",
-    "wellness-ops-a", "wellness-ops-b", "wellness-ops-c",
-    "bot-omp-delegate-disk", "A", "B", "C",
-}
-PROTECTED_PREFIXES = ("verify-521-", "verify-522-", "wellness-ops")
+PROTECTED_NAMES = {"bot-omp-delegate-disk", "A", "B", "C"}
 PROTECTED_RELATIVE_PATHS = (
     "Workspace", ".omp/agent/sessions", "orca", "Docker", ".docker",
     "Library/Containers/com.docker.docker",
@@ -47,6 +41,23 @@ class SafetyError(Exception):
     """A safety condition could not be established."""
 
 
+def protected_prefixes(*, required: bool) -> tuple[str, ...]:
+    try:
+        prefixes = json.loads((STATE_DIR / "protected-prefixes.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if not required:
+            return ()
+        raise SafetyError("Live cleanup requires protected-prefixes.json") from None
+    except (OSError, ValueError):
+        raise SafetyError("Cannot read protected-prefixes.json") from None
+    if not isinstance(prefixes, list) or not prefixes or not all(
+        isinstance(prefix, str) and prefix.strip() == prefix and prefix and "/" not in prefix
+        for prefix in prefixes
+    ):
+        raise SafetyError("protected-prefixes.json must be a nonempty list of path component prefixes")
+    return tuple(prefixes)
+
+
 def _run(args: list[str], *, timeout: int = 15) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
 
@@ -64,7 +75,7 @@ def _overlaps(a: Path, b: Path) -> bool:
     return a == b or a in b.parents or b in a.parents
 
 
-def _protected_path(candidate: Path) -> bool:
+def _protected_path(candidate: Path, prefixes: tuple[str, ...]) -> bool:
     home = HOME.resolve()
     resolved = candidate.resolve(strict=False)
     fixed = (home / name for name in PROTECTED_RELATIVE_PATHS)
@@ -72,7 +83,7 @@ def _protected_path(candidate: Path) -> bool:
         return True
     return any(
         part in PROTECTED_NAMES
-        or part.startswith(PROTECTED_PREFIXES)
+        or part.startswith(prefixes)
         or part.lower() in PROTECTED_COMPONENTS
         or any(fragment in part.lower() for fragment in PROTECTED_NAME_FRAGMENTS)
         for part in resolved.parts
@@ -548,7 +559,7 @@ def _chrome_processes() -> list[dict[str, int]] | None:
     return found
 
 
-def _run_once(dry_run: bool) -> int:
+def _run_once(dry_run: bool, prefixes: tuple[str, ...] = ()) -> int:
     now = time.time()
     before = shutil.disk_usage(HOME).free
     report: list[dict[str, object]] = []
@@ -561,7 +572,7 @@ def _run_once(dry_run: bool) -> int:
     else:
         guard_error = ""
     for candidate in candidates:
-        if _protected_path(candidate):
+        if _protected_path(candidate, prefixes):
             report.append({"action": "kept", "reason": "protected", "path": str(candidate)})
             continue
         if guard_error:
@@ -658,10 +669,11 @@ def _run_once(dry_run: bool) -> int:
 
 
 def run(dry_run: bool = False) -> int:
+    prefixes = protected_prefixes(required=not dry_run)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK_PATH.open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return _run_once(dry_run)
+        return _run_once(dry_run, prefixes)
 
 
 def main(argv: list[str] | None = None) -> int:

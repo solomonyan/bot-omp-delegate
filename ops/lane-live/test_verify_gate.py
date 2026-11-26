@@ -3,20 +3,21 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from verify_gate import decide, verifier_for, family
 
-BR = "lane-b/g13-harness"
-AUTHOR = {"id": "3341e818000f441e", "status": "running", "lane": "eng-m9-457-g13", "branch": BR}
-OTHER = [{"id": "d90ac16e1f7e4c61", "status": "running", "lane": "eng-settings-ux", "branch": "feat/settings-ux-upgrade"},
-         {"id": "31e2d3e797174e96", "status": "waiting_input", "lane": "design-launch-checkout", "branch": ""}]
+BR = "feature/author"
+AUTHOR = {"id": "author-job-1", "status": "running", "lane": "author", "branch": BR}
+OTHER = [{"id": "other-job-1", "status": "running", "lane": "other", "branch": "feature/other"},
+         {"id": "other-job-2", "status": "waiting_input", "lane": "design", "branch": ""}]
+CODEX = "openai-codex/test-model"
 
 
 def test_skips_while_author_live():
     ok, why = decide(BR, [AUTHOR] + OTHER, 5.0)
-    assert not ok and why.startswith("VERIFY-WAIT author live job=3341e818"), why
+    assert not ok and why.startswith("VERIFY-WAIT author live job=author-j"), why
 
 
 def test_skips_while_author_waiting_input():
     ok, why = decide(BR, [dict(AUTHOR, status="waiting_input")] + OTHER, 5.0)
-    assert not ok and "author live job=3341e818" in why, why
+    assert not ok and "author live job=author-j" in why, why
 
 
 def test_fires_after_author_finished():
@@ -25,7 +26,7 @@ def test_fires_after_author_finished():
 
 
 def test_verify_lane_is_not_an_author():
-    ok, why = decide(BR, OTHER + [{"id": "fb1cc25d", "status": "running", "lane": "verify-457-61fd49d2", "branch": BR}], 5.0)
+    ok, why = decide(BR, OTHER + [{"id": "verify-job", "status": "running", "lane": "verify-fixture", "branch": BR}], 5.0)
     assert ok, why
 
 
@@ -49,22 +50,22 @@ def test_never_at_load_40():
 
 
 def test_codex_author_gets_kimi():
-    assert verifier_for("openai-codex/gpt-6.1-sol") == ("kimi-code/k3.1-pro", "kimi")
-    assert verifier_for("openai-codex/gpt-6-luna") == ("kimi-code/k3.1-pro", "kimi")
+    assert verifier_for(CODEX, CODEX) == ("kimi-code/k3.1-pro", "kimi")
+    assert verifier_for("openai/another-model", CODEX) == ("kimi-code/k3.1-pro", "kimi")
 
 
 def test_claude_is_never_a_verifier():
-    for a in ("openai-codex/gpt-6.1-sol", "anthropic/claude-opus-4-6", "xai/grok-4.7", "", "kimi-code/k3.1-pro"):
-        assert verifier_for(a)[1] != "claude"
+    for a in (CODEX, "anthropic/claude-opus-4-6", "xai/grok-4.7", "", "kimi-code/k3.1-pro"):
+        assert verifier_for(a, CODEX)[1] != "claude"
 
 
 def test_kimi_author_gets_codex_claude_author_gets_kimi():
-    assert verifier_for("kimi-code/k3.1-pro") == ("openai-codex/gpt-6.1-sol", "codex")
-    assert verifier_for("anthropic/claude-opus-4-6") == ("kimi-code/k3.1-pro", "kimi")
+    assert verifier_for("kimi-code/k3.1-pro", CODEX) == (CODEX, "codex")
+    assert verifier_for("anthropic/claude-opus-4-6", CODEX) == ("kimi-code/k3.1-pro", "kimi")
 
 
 def test_unknown_author_defaults_to_kimi():
-    assert verifier_for("") == ("kimi-code/k3.1-pro", "kimi") and family("") == "unknown"
+    assert verifier_for("", CODEX) == ("kimi-code/k3.1-pro", "kimi") and family("") == "unknown"
 
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -1,4 +1,4 @@
-"""verify_gate — decide whether lane_live may auto-dispatch a verify on a PR head (2026-11-11, JARVIS via FRIDAY).
+"""verify_gate — decide whether lane_live may auto-dispatch a verifier on a PR head.
 
 Two conditions, both required:
   (a) no live omp AUTHOR job on the PR's head branch (verify-* lanes are never authors);
@@ -52,7 +52,7 @@ def load_jobs(jobs_dir, lanes_by_id, sim_done=()):
 
 
 # --- verifier model family (2026-11-11): the verifier must be a different model family from the author.
-KIMI, CODEX = "kimi-code/k3.1-pro", "openai-codex/gpt-6.1-sol"  # Claude is never a verifier (Solomon, 11 Nov 2026 16:26 HKT)
+KIMI = "kimi-code/k3.1-pro"
 FAMILY = {"openai-codex": "codex", "openai": "codex", "kimi-code": "kimi", "anthropic": "claude"}
 
 
@@ -60,9 +60,9 @@ def family(model):
     return FAMILY.get((model or "").split("/", 1)[0], "unknown")
 
 
-def verifier_for(author_model):
+def verifier_for(author_model, codex_model):
     """Pure. Kimi author -> Codex; every other author (Codex, Claude, Grok, unknown) -> Kimi. Never Claude. Returns (model, family)."""
-    m = CODEX if family(author_model) == "kimi" else KIMI
+    m = codex_model if family(author_model) == "kimi" else KIMI
     return m, family(m)
 
 

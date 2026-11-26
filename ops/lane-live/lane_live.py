@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """lane_live — Mac-side executor for the print-only dryrun scripts (README step 3: execute OUTSIDE the scripts).
-Runs every 3 min under launchd (com.solomon.lane-live). Per lane A/B/C: acts only if LIVE/<L>.live exists AND
+Runs under launchd. Per lane A/B/C: acts only if LIVE/<L>.live exists AND
 the lane has no activeJob. Runs lane_dispatch.py --dry-run and executes only its WOULD-RUN lines for live lanes.
 Verify: if LIVE/verify.live exists, runs lane_verify.py --dry-run and dispatches at most 1 new verify per tick,
 max MAX_VERIFY concurrent verify-* jobs. Logs every action to LIVE/events.log (HKT).
 2026-11-11 autoverify gate (verify_gate.py): a PR head is auto-verified only when no live omp author job is on its
 branch AND active omp jobs are under the Mac cap (6; 4 at load1>=25; none at load1>=40). Skips log VERIFY-WAIT.
-Dry run: LANE_LIVE_DRY_RUN=1 runs the verify decision against live state, prints events to stdout, writes and
-dispatches nothing (LANE_LIVE_SIM_DONE=<job-id prefixes> treats those jobs as finished).
+Dry run: LANE_LIVE_DRY_RUN=1 prints events and uses a disposable private status file.
+It does not change live state or dispatch (LANE_LIVE_SIM_DONE=<job-id prefixes> treats those jobs as finished).
 2026-11-11 verifier family: each verify session is pinned (session configure --model) to a different family from the
 author's session model: Kimi author -> Codex; every other author -> kimi-code/k3.1-pro. Never Claude."""
-import json, os, re, subprocess, sys, datetime as dt, glob
+import json, os, re, subprocess, sys, datetime as dt, glob, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import verify_gate
 DRY = os.environ.get("LANE_LIVE_DRY_RUN") == "1"
 SIM_DONE = tuple(x for x in os.environ.get("LANE_LIVE_SIM_DONE", "").split(",") if x) if DRY else ()
 HKT = dt.timezone(dt.timedelta(hours=8)); H = os.path.expanduser("~")
 LIVE = f"{H}/lanes/omp-runs/live"; BIN = f"{LIVE}/bin"; Q = f"{H}/lanes/omp-runs/queue"
-OMP = f"{H}/Workspace/bot-omp-delegate/scripts/omp-delegate"; REPO = f"{H}/Workspace/3d-ui-playground/wellness-ops"
-IDS = {"A": "c986101dd2034bb29b0c42d72248f760", "B": "a4e999d856eb4ca395d7fa8fc6eb87e5", "C": "561a3d901e9141a1b7782c85b5de0c72"}
+OMP = f"{H}/Workspace/bot-omp-delegate/scripts/omp-delegate"
 MAX_VERIFY = int(os.environ.get("MAX_VERIFY", "2"))
 os.environ["PATH"] = f"{H}/Workspace/bot-omp-delegate/scripts:{H}/.local/bin:{H}/.bun/bin:/opt/homebrew/bin:" + os.environ["PATH"]
 now = dt.datetime.now(HKT); NOW = now.strftime("%Y-%m-%d %H:%M:%S HKT")
@@ -31,13 +30,30 @@ def jl(p, d):
 st = jl(f"{LIVE}/state.json", {"idle_since": {}, "last_job": {}, "forced_done": []})
 if os.path.exists(f"{H}/lanes/omp-runs/DRAIN-HOLD"):
     ev("HOLD DRAIN-HOLD present; no dispatch"); sys.exit(0)
-# Apply only after the compact event writer has been deployed by Solomon.
+try:
+    with open(f"{LIVE}/config.json") as f:
+        config = json.load(f)
+    REPO = os.path.expanduser(config["repo"])
+    IDS = config["lane_ids"]
+    CALLER = config["caller"]
+    COORDINATOR = config["coordinator_subscriber_id"]
+    CODEX_MODEL = config["codex_model"]
+    VERIFY_INSTRUCTIONS = config.get("verify_instructions", "")
+    if (not os.path.isabs(REPO) or set(IDS) != {"A", "B", "C"}
+            or not all(isinstance(i, str) and i for i in IDS.values()) or len(set(IDS.values())) != 3
+            or not all(isinstance(s, str) and s for s in (CALLER, COORDINATOR, CODEX_MODEL))
+            or verify_gate.family(CODEX_MODEL) != "codex" or not isinstance(VERIFY_INSTRUCTIONS, str)):
+        raise ValueError
+except (OSError, ValueError, TypeError, KeyError, AttributeError):
+    sys.exit("Missing or invalid lane-live config.json; see ops/lane-live/README.md")
+# Apply only after the compact event writer has been deployed.
 # Retain the log-size warning and idle gzip; interrupt only below the dispatch floor.
 import shutil as _sh
 _MIN_GB = float(os.environ.get("LANE_MIN_FREE_GB", "25"))
 _FREE = _sh.disk_usage(H).free / 1e9
 _J = f"{H}/.omp-delegate/jobs"; _WARN = float(os.environ.get("JOB_LOG_WARN_GB", "5"))
-os.makedirs(f"{LIVE}/logcap", exist_ok=True)
+if not DRY:
+    os.makedirs(f"{LIVE}/logcap", exist_ok=True)
 _gz_busy = subprocess.run(["pgrep", "-x", "gzip"], capture_output=True).returncode == 0
 for _p in ([] if DRY else glob.glob(f"{_J}/*.jsonl")):
     try: _s = os.path.getsize(_p) / 1e9; _age = now.timestamp() - os.path.getmtime(_p)
@@ -67,8 +83,12 @@ for L, i in IDS.items():
 for l in lanes:
     if l["id"] in IDS.values(): continue
     ls["side_lanes"].append({"name": l["name"], "lane_id": l["id"], "state": "running" if l.get("activeJob") else "idle", "job_id": l.get("activeJob") or ""})
-LS = "/tmp/lane-status.dryrun.json" if DRY else f"{LIVE}/lane-status.mac.json"
-json.dump(ls, open(LS, "w"), indent=1)
+LS = f"{LIVE}/lane-status.mac.json"
+if not DRY:
+    fd = os.open(LS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as status_file:
+        os.fchmod(status_file.fileno(), 0o600)
+        json.dump(ls, status_file, indent=1)
 live = [L for L in IDS if os.path.exists(f"{LIVE}/{L}.live")]
 for L in live:
     if not DRY and ls["lanes"][L]["state"] == "idle" and not os.path.exists(f"{LIVE}/{L}.switched"):
@@ -91,8 +111,16 @@ if not DRY and any(ls["lanes"][L]["state"] == "idle" for L in live):
 # --- verify
 if DRY or os.path.exists(f"{LIVE}/verify.live"):
     running = [s for s in ls["side_lanes"] if s["name"].startswith("verify-") and s["state"] == "running"]
-    env = dict(os.environ, FORCE_REVERIFY=",".join(x for x in os.environ.get("FORCE_REVERIFY", "450,454").split(",") if x and x not in st["forced_done"]))
-    r = sh(["python3", f"{BIN}/lane_verify.py", "--dry-run", "--lane-status", LS, "--prompt-root", f"{Q}/verify"], env=env)
+    forced = set(os.environ.get("FORCE_REVERIFY", "").split(",")) - {""}
+    env = dict(os.environ, FORCE_REVERIFY=",".join(sorted(forced.difference(st["forced_done"]))))
+    if DRY:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as status_file:
+            json.dump(ls, status_file, indent=1)
+            status_file.flush()
+            r = sh(["python3", f"{BIN}/lane_verify.py", "--dry-run", "--lane-status", status_file.name,
+                    "--prompt-root", f"{Q}/verify"], env=env)
+    else:
+        r = sh(["python3", f"{BIN}/lane_verify.py", "--dry-run", "--lane-status", LS, "--prompt-root", f"{Q}/verify"], env=env)
     need = re.findall(r"^NEED #(\d+) (\S+)@([0-9a-f]{8}) draft=\S+ author=(.+?) verifier=(\S+) Check=", r.stdout, re.M)
     if r.returncode: ev(f"VERIFY-ERR lane_verify rc={r.returncode} {r.stderr.strip()[-200:]!r}")
     if need and len(running) >= MAX_VERIFY: need = []
@@ -101,23 +129,21 @@ if DRY or os.path.exists(f"{LIVE}/verify.live"):
         if not ok or DRY: ev(f"{why} #{need[0][0]} {need[0][1]}@{need[0][2]}")
         if not ok: need = []
     for num, branch, sha, author, vname in need[:1]:
-        sh(["git", "-C", REPO, "fetch", "-q", "origin", branch])
-        full = sh(["git", "-C", REPO, "rev-parse", "FETCH_HEAD"]).stdout.strip()
         if any(s["name"].startswith(vname) and s["state"] == "running" for s in ls["side_lanes"]): continue
         name = vname; lane_name = f"{name}-{sha}"
-        # 2026-11-01 19:20: match the create name (name-sha), not bare vname — bare match caused 409 spam on #450
-        # 2026-11-10 (Solomon 13:50 HKT via JARVIS): verify jobs run yolo, labeled omp-caller:friday, coordinator
-        # jarvis-omp-events, and REUSE the PR's existing verify lane/session instead of one write-mode lane per head.
+        # Reuse the existing verify lane/session instead of creating one per head.
         vh = st.setdefault("verified_heads", {})
         if vh.get(num) == sha:
             ev(f"VERIFY-SKIP #{num} @{sha} already dispatched on this head"); continue
         if any(s["name"] == lane_name for s in ls["side_lanes"]) and num not in vh:
             vh[num] = sha; ev(f"VERIFY-SKIP #{num} {lane_name} already exists (seeded verified_heads)"); continue
         amodel = verify_gate.author_model(branch, lanes, f"{H}/.omp-delegate/sessions")
-        vmodel, vfam = verify_gate.verifier_for(amodel)
+        vmodel, vfam = verify_gate.verifier_for(amodel, CODEX_MODEL)
         afam = verify_gate.family(amodel)
         if DRY: ev(f"VERIFY-DRYRUN author_model={amodel or '?'} ({afam}) verifier_model={vmodel} ({vfam})")
         if DRY: ev(f"VERIFY-DRYRUN would dispatch #{num} {branch}@{sha} verifier={vname} (nothing dispatched)"); break
+        sh(["git", "-C", REPO, "fetch", "-q", "origin", branch])
+        full = sh(["git", "-C", REPO, "rev-parse", "FETCH_HEAD"]).stdout.strip()
         prev = [s for s in ls["side_lanes"] if s["name"].startswith(f"{vname}-")]
         if prev:
             lid = prev[-1]["lane_id"]
@@ -139,7 +165,6 @@ if DRY or os.path.exists(f"{LIVE}/verify.live"):
         mode = opts.get("approval_mode")
         if mode != "yolo": ev(f"VERIFY-FAIL #{num} lane={lid} session={sid} approval_mode={mode} (refusing non-yolo verify)"); break
         if opts.get("model") != vmodel or vfam == afam: ev(f"VERIFY-FAIL #{num} lane={lid} session={sid} model={opts.get('model')} author={amodel} (refusing same-family/unpinned verify)"); break
-        # 2026-11-02 VISION: side lanes must notify MELCHIOR; no-op while the subscriber covers all lanes
         try:
             wr = sh([sys.executable, f"{BIN}/webhook_register.py", lane_name]).stdout.strip()
             if wr != "covered-all-lanes": ev(f"WEBHOOK-REGISTER {lane_name} {wr}")
@@ -149,14 +174,14 @@ if DRY or os.path.exists(f"{LIVE}/verify.live"):
 You are an independent verifier (author lane: {author}).
 Model family: you run on {vmodel} (family {vfam}); the author ran on {amodel or 'unknown'} (family {afam}). SIGNOFF.md must include the line "Verifier family: {vfam} ({vmodel}); author family: {afam} ({amodel or 'unknown'})". If your own model is not {vfam}, stop and report VERDICT FAIL (wrong verifier family). Worktree {wt} is detached at {full}. Do not edit product code, do not push, never force-push, never push to main, never print secrets.
 Review the diff vs origin/main, then run targeted tests for the touched packages (the full suite runs as the box Check; do not run it here).
-DB: No Docker on this Mac (Solomon, 10 Nov). Never run docker, open Docker Desktop, or pnpm verify:local, and do not start any real Postgres (Docker or Homebrew initdb/pg_ctl). Use PGLite only: pnpm check:static; env -u DATABASE_URL -u TEST_DATABASE_URL -u CI node --import tsx scripts/test-runner.ts (postgresql-engine tests skip by design); env -u DATABASE_URL pnpm db:check; the scripts/*-ui-smoke.ts smokes (already PGLite); pnpm build. pnpm check / pnpm test need TEST_DATABASE_URL: skip them and report that the real-PostgreSQL gate was not run locally (GitHub CI runs it). If a check truly needs real Postgres with no PGLite path, stop and report it instead.
+{VERIFY_INSTRUCTIONS}
 Finish with one line: VERDICT PASS|FAIL #{num} @{sha} patch-id <git patch-id of the diff> plus evidence. Post nothing to GitHub; the Eng Lead posts it.
 """
             + sh([sys.executable, f"{BIN}/signoff_gate.py", "brief", "--pr", str(num), "--sha", full]).stdout)
-        res = sh([f"{H}/bin/omp-dispatch", "--caller", "friday", lid, p, "2"], env=dict(os.environ, OMP_COORDINATOR_SUBSCRIBER_ID="jarvis-omp-events")); ok = res.returncode == 0
+        res = sh([f"{H}/bin/omp-dispatch", "--caller", CALLER, lid, p, "2"], env=dict(os.environ, OMP_COORDINATOR_SUBSCRIBER_ID=COORDINATOR)); ok = res.returncode == 0
         if ok: vh[num] = sha
-        if ok and num in ("450", "454"): st["forced_done"].append(num)
-        ev(f"VERIFY #{num} {branch}@{sha} lane={lid} yolo label=omp-caller:friday {'OK' if ok else 'FAIL rc=%d' % res.returncode} running_verifies={len(running)} out={(res.stdout+res.stderr).strip()[-200:]!r}")
+        if ok and num in forced: st["forced_done"].append(num)
+        ev(f"VERIFY #{num} {branch}@{sha} lane={lid} yolo label=omp-caller:{CALLER} {'OK' if ok else 'FAIL rc=%d' % res.returncode} running_verifies={len(running)} out={(res.stdout+res.stderr).strip()[-200:]!r}")
 if not DRY:
     json.dump(st, open(f"{LIVE}/state.json", "w"), indent=1)
     open(f"{LIVE}/heartbeat", "w").write(NOW + "\n")

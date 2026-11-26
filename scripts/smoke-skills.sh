@@ -14,15 +14,14 @@
 #   kimi  — ~/.kimi-code/skills
 #
 # Usage: scripts/smoke-skills.sh
-# Env:   OMP_DELEGATE_BIN, SMOKE_SKILLS_LABEL (default omp-caller:friday),
+# Env:   OMP_DELEGATE_BIN, SMOKE_SKILLS_LABEL (optional caller-routing label),
 #        SMOKE_SKILLS_MAX_WAIT_SEC (default 900), SMOKE_SKILLS_POLL_SEC (default 10),
-#        OMP_COORDINATOR_SUBSCRIBER_ID (optional; omitted by default so the
-#        coordinator is not notified).
+#        OMP_COORDINATOR_SUBSCRIBER_ID (optional explicit webhook subscriber).
 set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${OMP_DELEGATE_BIN:-$ROOT/scripts/omp-delegate}"
-LABEL="${SMOKE_SKILLS_LABEL:-omp-caller:friday}"
+LABEL="${SMOKE_SKILLS_LABEL:-}"
 MAX_WAIT_SEC="${SMOKE_SKILLS_MAX_WAIT_SEC:-900}"
 POLL_SEC="${SMOKE_SKILLS_POLL_SEC:-10}"
 COORD="${OMP_COORDINATOR_SUBSCRIBER_ID:-}"
@@ -93,9 +92,9 @@ resolve_skills() {
 }
 
 LANES_TO_DELETE=""
-SCRATCH_TO_DELETE=""
+scratch_root=""
 cleanup() {
-  local id dir
+  local id
   for id in $LANES_TO_DELETE; do
     if [ -n "$id" ]; then
       # Idle workers must be closed before the registration can be removed (HTTP 409 otherwise).
@@ -103,11 +102,9 @@ cleanup() {
       "$BIN" lane delete "$id" >/dev/null 2>&1 || true
     fi
   done
-  for dir in $SCRATCH_TO_DELETE; do
-    if [ -n "$dir" ] && [ -d "$dir" ]; then
-      rm -rf "$dir"
-    fi
-  done
+  if [ -n "$scratch_root" ]; then
+    rm -rf -- "$scratch_root"
+  fi
 }
 trap cleanup EXIT
 
@@ -117,6 +114,10 @@ if [ ! -x "$BIN" ]; then
   echo "FAIL: delegate binary not executable: $BIN" >&2
   exit 1
 fi
+
+scratch_root="$(mktemp -d "${TMPDIR:-/tmp}/smoke-skills.XXXXXX")"
+stderr_file="$scratch_root/stderr"
+snap_file="$scratch_root/snapshot"
 
 for backend in $BACKENDS; do
   echo "=== $backend ==="
@@ -153,25 +154,23 @@ EOF
   echo "resolved:"
   printf '%s\n' "$resolved"
 
-  scratch="$(mktemp -d "${TMPDIR:-/tmp}/smoke-skills.${backend}.XXXXXX")"
-  SCRATCH_TO_DELETE="$SCRATCH_TO_DELETE $scratch"
+  scratch="$scratch_root/$backend"
+  mkdir -- "$scratch"
   printf 'smoke-skills scratch for %s\n' "$backend" > "$scratch/README.txt"
 
   lane_name="smoke-skills-${backend}-$$-$(date +%H%M%S)"
   create_out=""
-  if ! create_out="$("$BIN" lane create --name "$lane_name" --cwd "$scratch" --backend "$backend" 2>/tmp/smoke-skills-create-err.$$)"; then
-    echo "FAIL $backend: lane create failed: $(tr '\n' ' ' </tmp/smoke-skills-create-err.$$)"
-    rm -f /tmp/smoke-skills-create-err.$$
+  if ! create_out="$("$BIN" lane create --name "$lane_name" --cwd "$scratch" --backend "$backend" 2>"$stderr_file")"; then
+    echo "FAIL $backend: lane create failed"
     FAILED=1
     continue
   fi
-  rm -f /tmp/smoke-skills-create-err.$$
   lane_id="$(printf '%s' "$create_out" | json_get - id || true)"
   if [ -z "$lane_id" ]; then
     lane_id="$(printf '%s' "$create_out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("lane") or {}).get("id",""))' || true)"
   fi
   if [ -z "$lane_id" ]; then
-    echo "FAIL $backend: lane create returned no id: $create_out"
+    echo "FAIL $backend: lane create returned no id"
     FAILED=1
     continue
   fi
@@ -187,21 +186,22 @@ $path"
 $resolved
 EOF
 
-  run_args=(lane run --detach --label "$LABEL")
+  run_args=(lane run --detach)
+  if [ -n "$LABEL" ]; then
+    run_args+=(--label "$LABEL")
+  fi
   if [ -n "$COORD" ]; then
     run_args+=(--coordinator-subscriber-id "$COORD")
   fi
   run_out=""
-  if ! run_out="$("$BIN" "${run_args[@]}" "$lane_id" "$prompt" 2>/tmp/smoke-skills-run-err.$$)"; then
-    echo "FAIL $backend: lane run failed: $(tr '\n' ' ' </tmp/smoke-skills-run-err.$$)"
-    rm -f /tmp/smoke-skills-run-err.$$
+  if ! run_out="$("$BIN" "${run_args[@]}" "$lane_id" "$prompt" 2>"$stderr_file")"; then
+    echo "FAIL $backend: lane run failed"
     FAILED=1
     continue
   fi
-  rm -f /tmp/smoke-skills-run-err.$$
   job_id="$(printf '%s' "$run_out" | json_get - id || true)"
   if [ -z "$job_id" ]; then
-    echo "FAIL $backend: lane run returned no job id: $run_out"
+    echo "FAIL $backend: lane run returned no job id"
     FAILED=1
     continue
   fi
@@ -209,16 +209,13 @@ EOF
 
   elapsed=0
   status=""
-  snap_file="$(mktemp "${TMPDIR:-/tmp}/smoke-skills-snap.XXXXXX")"
   while :; do
-    if ! "$BIN" read "$job_id" >"$snap_file" 2>/tmp/smoke-skills-read-err.$$; then
-      echo "FAIL $backend: read failed: $(tr '\n' ' ' </tmp/smoke-skills-read-err.$$)"
-      rm -f /tmp/smoke-skills-read-err.$$ "$snap_file"
+    if ! "$BIN" read "$job_id" >"$snap_file" 2>"$stderr_file"; then
+      echo "FAIL $backend: read failed"
       FAILED=1
       status="read-failed"
       break
     fi
-    rm -f /tmp/smoke-skills-read-err.$$
     status="$(json_get "$snap_file" status || true)"
     case "$status" in
       completed|aborted|error|interrupted)
@@ -242,18 +239,13 @@ EOF
 
   if [ "$status" != "completed" ]; then
     if [ "$status" != "waiting_input" ] && [ "$status" != "timeout" ] && [ "$status" != "read-failed" ]; then
-      err="$(json_get "$snap_file" error || true)"
-      echo "FAIL $backend: job $job_id status=$status ${err:+error=$err}"
+      echo "FAIL $backend: job $job_id status=$status"
       FAILED=1
     fi
-    rm -f "$snap_file"
     continue
   fi
 
   message="$(json_get "$snap_file" finalMessage || true)"
-  rm -f "$snap_file"
-  excerpt="$(printf '%s' "$message" | python3 -c 'import sys; t=sys.stdin.read().strip().replace("\n"," | "); print(t[:400])')"
-  echo "reply: $excerpt"
 
   lc="$(printf '%s' "$message" | tr '[:upper:]' '[:lower:]')"
   missing_names=""
